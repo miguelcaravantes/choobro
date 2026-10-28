@@ -1,0 +1,348 @@
+use objc2::{
+    MainThreadOnly, define_class, msg_send,
+    rc::Retained,
+    runtime::{ProtocolObject, Sel},
+    sel,
+};
+use objc2_app_kit::*;
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, ns_string,
+};
+
+use crate::{app::Delegate, browsers::Browser};
+
+define_class!(
+    #[unsafe(super = NSStackView)]
+    #[thread_kind = MainThreadOnly]
+    struct BrowserList;
+
+    unsafe impl NSObjectProtocol for BrowserList {}
+
+    impl BrowserList {
+        #[unsafe(method(isFlipped))]
+        fn is_flipped(&self) -> bool {
+            true
+        }
+    }
+);
+
+pub struct Chooser {
+    pub window: Retained<NSWindow>,
+    pub table: Retained<NSTableView>,
+    pub preview: Retained<NSTextField>,
+    pub message: Retained<NSTextField>,
+    pub open: Retained<NSButton>,
+    pub cancel: Retained<NSButton>,
+}
+
+pub struct Settings {
+    pub window: Retained<NSWindow>,
+    pub status: Retained<NSTextField>,
+    pub make_default: Retained<NSButton>,
+}
+
+pub fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
+    NSTextField::labelWithString(&NSString::from_str(text), mtm)
+}
+
+fn stack(mtm: MainThreadMarker, vertical: bool) -> Retained<NSStackView> {
+    let stack = NSStackView::new(mtm);
+    stack.setOrientation(if vertical {
+        NSUserInterfaceLayoutOrientation::Vertical
+    } else {
+        NSUserInterfaceLayoutOrientation::Horizontal
+    });
+    stack.setAlignment(if vertical {
+        NSLayoutAttribute::Leading
+    } else {
+        NSLayoutAttribute::CenterY
+    });
+    stack.setSpacing(12.0);
+    stack.setTranslatesAutoresizingMaskIntoConstraints(false);
+    stack
+}
+
+pub fn button(title: &str, action: Sel, target: &Delegate) -> Retained<NSButton> {
+    unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str(title),
+            Some(target),
+            Some(action),
+            target.mtm(),
+        )
+    }
+}
+
+fn window(
+    title: &str,
+    width: f64,
+    height: f64,
+    target: &Delegate,
+) -> (Retained<NSWindow>, Retained<NSStackView>) {
+    let mtm = target.mtm();
+    let window = unsafe {
+        NSWindow::initWithContentRect_styleMask_backing_defer(
+            NSWindow::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+            NSBackingStoreType::Buffered,
+            false,
+        )
+    };
+    unsafe { window.setReleasedWhenClosed(false) };
+    window.setTitle(&NSString::from_str(title));
+    window.setDelegate(Some(ProtocolObject::from_ref(target)));
+    window.center();
+    let content = window.contentView().expect("window content view");
+    content.setWantsLayer(true);
+    let root = stack(mtm, true);
+    content.addSubview(&root);
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        root.widthAnchor().constraintEqualToConstant(width - 48.0),
+        root.leadingAnchor()
+            .constraintEqualToAnchor_constant(&content.leadingAnchor(), 24.0),
+        root.trailingAnchor()
+            .constraintEqualToAnchor_constant(&content.trailingAnchor(), -24.0),
+        root.topAnchor()
+            .constraintEqualToAnchor_constant(&content.topAnchor(), 24.0),
+        root.bottomAnchor()
+            .constraintEqualToAnchor_constant(&content.bottomAnchor(), -24.0),
+    ]));
+    (window, root)
+}
+
+fn fill_width(view: &NSView, root: &NSView) {
+    view.widthAnchor()
+        .constraintEqualToAnchor(&root.widthAnchor())
+        .setActive(true);
+}
+
+pub fn chooser(target: &Delegate) -> Chooser {
+    let mtm = target.mtm();
+    let (window, root) = window("Choose Browser", 480.0, 400.0, target);
+    let heading = label("Open with…", mtm);
+    heading.setFont(Some(&NSFont::boldSystemFontOfSize(20.0)));
+    root.addArrangedSubview(&heading);
+    let preview = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+    preview.setSelectable(true);
+    preview.setPreferredMaxLayoutWidth(432.0);
+    preview.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
+    preview.setMaximumNumberOfLines(3);
+    root.addArrangedSubview(&preview);
+    fill_width(&preview, &root);
+
+    let table = NSTableView::new(mtm);
+    let column =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("browser"));
+    column.setWidth(420.0);
+    table.addTableColumn(&column);
+    table.setHeaderView(None);
+    table.setRowHeight(44.0);
+    table.setAllowsEmptySelection(false);
+    table.setAllowsMultipleSelection(false);
+    unsafe {
+        table.setDataSource(Some(ProtocolObject::from_ref(target)));
+        table.setDelegate(Some(ProtocolObject::from_ref(target)));
+        table.setTarget(Some(target));
+        table.setDoubleAction(Some(sel!(openBrowser:)));
+    }
+    table.setAccessibilityLabel(Some(ns_string!("Installed browsers")));
+    let scroll = NSScrollView::new(mtm);
+    scroll.setDocumentView(Some(&table));
+    scroll.setHasVerticalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    root.addArrangedSubview(&scroll);
+    fill_width(&scroll, &root);
+    scroll
+        .heightAnchor()
+        .constraintGreaterThanOrEqualToConstant(100.0)
+        .setActive(true);
+
+    let message = label("", mtm);
+    message.setMaximumNumberOfLines(2);
+    message.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    root.addArrangedSubview(&message);
+    fill_width(&message, &root);
+    let actions = stack(mtm, false);
+    let settings = button("Settings…", sel!(showSettings:), target);
+    let cancel = button("Cancel", sel!(cancelRequest:), target);
+    cancel.setKeyEquivalent(ns_string!("\u{1b}"));
+    let open = button("Open", sel!(openBrowser:), target);
+    open.setKeyEquivalent(ns_string!("\r"));
+    actions.addArrangedSubview(&settings);
+    let spacer = NSView::new(mtm);
+    actions.addArrangedSubview(&spacer);
+    actions.addArrangedSubview(&cancel);
+    actions.addArrangedSubview(&open);
+    root.addArrangedSubview(&actions);
+    fill_width(&actions, &root);
+    window.setInitialFirstResponder(Some(&table));
+    Chooser {
+        window,
+        table,
+        preview,
+        message,
+        open,
+        cancel,
+    }
+}
+
+pub fn browser_cell(browser: &Browser, mtm: MainThreadMarker) -> Retained<NSView> {
+    let cell = NSTableCellView::new(mtm);
+    let icon = NSImageView::new(mtm);
+    icon.setImage(Some(&browser.icon));
+    icon.setTranslatesAutoresizingMaskIntoConstraints(false);
+    let text = label(&browser.name, mtm);
+    text.setTranslatesAutoresizingMaskIntoConstraints(false);
+    cell.addSubview(&icon);
+    cell.addSubview(&text);
+    unsafe {
+        cell.setTextField(Some(&text));
+        cell.setImageView(Some(&icon));
+    }
+    cell.setToolTip(Some(&NSString::from_str(&browser.path)));
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        icon.leadingAnchor()
+            .constraintEqualToAnchor_constant(&cell.leadingAnchor(), 8.0),
+        icon.centerYAnchor()
+            .constraintEqualToAnchor(&cell.centerYAnchor()),
+        icon.widthAnchor().constraintEqualToConstant(28.0),
+        icon.heightAnchor().constraintEqualToConstant(28.0),
+        text.leadingAnchor()
+            .constraintEqualToAnchor_constant(&icon.trailingAnchor(), 12.0),
+        text.trailingAnchor()
+            .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -8.0),
+        text.centerYAnchor()
+            .constraintEqualToAnchor(&cell.centerYAnchor()),
+    ]));
+    Retained::into_super(cell)
+}
+
+pub fn settings(
+    target: &Delegate,
+    browsers: &[Browser],
+    excluded: &std::collections::BTreeSet<String>,
+    configuring: bool,
+) -> Settings {
+    let mtm = target.mtm();
+    let (window, root) = window("ChooBro Settings", 520.0, 440.0, target);
+    let heading = label("Choose your browsers", mtm);
+    heading.setFont(Some(&NSFont::boldSystemFontOfSize(20.0)));
+    root.addArrangedSubview(&heading);
+    root.addArrangedSubview(&label("Checked browsers appear when you open a link.", mtm));
+    let list: Retained<BrowserList> = unsafe { msg_send![BrowserList::alloc(mtm), init] };
+    list.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
+    list.setAlignment(NSLayoutAttribute::Leading);
+    list.setSpacing(12.0);
+    list.setTranslatesAutoresizingMaskIntoConstraints(false);
+    for (index, browser) in browsers.iter().enumerate() {
+        let toggle = unsafe {
+            NSButton::checkboxWithTitle_target_action(
+                &NSString::from_str(&browser.name),
+                Some(target),
+                Some(sel!(toggleBrowser:)),
+                mtm,
+            )
+        };
+        toggle.setTag(index as isize);
+        toggle.setState(if excluded.contains(&browser.id) {
+            NSControlStateValueOff
+        } else {
+            NSControlStateValueOn
+        });
+        toggle.setToolTip(Some(&NSString::from_str(&browser.path)));
+        list.addArrangedSubview(&toggle);
+    }
+    if browsers.is_empty() {
+        list.addArrangedSubview(&label(
+            "No registered browsers found. Install a browser, then refresh.",
+            mtm,
+        ));
+    }
+    let scroll = NSScrollView::new(mtm);
+    scroll.setDocumentView(Some(&list));
+    scroll.setHasVerticalScroller(true);
+    scroll.setAutohidesScrollers(true);
+    root.addArrangedSubview(&scroll);
+    fill_width(&scroll, &root);
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        list.widthAnchor()
+            .constraintEqualToAnchor(&scroll.contentView().widthAnchor()),
+        scroll
+            .heightAnchor()
+            .constraintGreaterThanOrEqualToConstant(100.0),
+    ]));
+    let status = label(&crate::browsers::default_status(), mtm);
+    status.setMaximumNumberOfLines(3);
+    root.addArrangedSubview(&status);
+    fill_width(&status, &root);
+    let actions = stack(mtm, false);
+    let refresh = button("Refresh", sel!(showSettings:), target);
+    let make_default = button("Make Default Browser…", sel!(makeDefault:), target);
+    make_default.setEnabled(!configuring);
+    actions.addArrangedSubview(&refresh);
+    actions.addArrangedSubview(&make_default);
+    root.addArrangedSubview(&actions);
+    let help = label(
+        "You can also change the default browser in System Settings.",
+        mtm,
+    );
+    help.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    root.addArrangedSubview(&help);
+    Settings {
+        window,
+        status,
+        make_default,
+    }
+}
+
+fn menu(target: &Delegate) -> Retained<NSMenu> {
+    let menu = NSMenu::new(target.mtm());
+    for (title, action, key) in [
+        ("Settings…", sel!(showSettings:), ","),
+        ("Show Pending Links", sel!(showChooser:), ""),
+        ("Quit ChooBro", sel!(quit:), "q"),
+    ] {
+        let item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(target.mtm()),
+                &NSString::from_str(title),
+                Some(action),
+                &NSString::from_str(key),
+            )
+        };
+        unsafe { item.setTarget(Some(target)) };
+        menu.addItem(&item);
+    }
+    menu
+}
+
+pub fn menus(target: &Delegate) -> Retained<NSStatusItem> {
+    let app = NSApplication::sharedApplication(target.mtm());
+    let main = NSMenu::new(target.mtm());
+    let item = NSMenuItem::new(target.mtm());
+    item.setSubmenu(Some(&menu(target)));
+    main.addItem(&item);
+    app.setMainMenu(Some(&main));
+    let status = NSStatusBar::systemStatusBar().statusItemWithLength(NSVariableStatusItemLength);
+    if let Some(button) = status.button(target.mtm()) {
+        button.setTitle(ns_string!("CB"));
+        button.setToolTip(Some(ns_string!("ChooBro — Choose Browser")));
+    }
+    status.setMenu(Some(&menu(target)));
+    status
+}
+
+pub fn alert(title: &str, detail: &str, mtm: MainThreadMarker) {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str(detail));
+    alert.addButtonWithTitle(ns_string!("OK"));
+    alert.runModal();
+}
+
+pub fn present(window: &NSWindow, mtm: MainThreadMarker) {
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    window.makeKeyAndOrderFront(None);
+}
