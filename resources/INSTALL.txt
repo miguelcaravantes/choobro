@@ -12,7 +12,10 @@ Install
 Alternative: Homebrew
 
 brew tap miguelcaravantes/choobro https://github.com/miguelcaravantes/choobro
+brew trust --cask miguelcaravantes/choobro/choobro
 brew install --cask miguelcaravantes/choobro/choobro
+
+Use a current Homebrew version. Homebrew 7 requires the explicit cask trust step; update Homebrew first if the command is unavailable.
 
 This custom cask removes the quarantine attribute only from ChooBro.app to avoid its quarantine-triggered first-launch warning. It does not disable Gatekeeper globally or make the app Apple-verified. Only use this installation route if you trust the project. Quit and remove any manually installed copy before switching to Homebrew; preferences are stored separately.
 

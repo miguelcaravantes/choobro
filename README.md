@@ -20,12 +20,15 @@ Built in Rust with a native macOS interface.
 
 ### Homebrew
 
-For Apple Silicon Macs with [Homebrew](https://brew.sh/) installed:
+For Apple Silicon Macs with a current version of [Homebrew](https://brew.sh/) installed:
 
 ```sh
 brew tap miguelcaravantes/choobro https://github.com/miguelcaravantes/choobro
+brew trust --cask miguelcaravantes/choobro/choobro
 brew install --cask miguelcaravantes/choobro/choobro
 ```
+
+Homebrew 7 requires the explicit cask trust step. If `brew trust` isn't available, update Homebrew before continuing.
 
 Open ChooBro from Applications, click **Make Default Browser…** in Settings, and approve the macOS prompts.
 
