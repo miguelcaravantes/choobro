@@ -18,18 +18,18 @@ Built in Rust with a native macOS interface.
 
 ## Get started
 
-ChooBro is an early preview. For now, build it from source on a Mac with [Rust](https://rustup.rs/) and Xcode Command Line Tools installed:
+**[Download the preview DMG](https://github.com/miguelcaravantes/choobro/releases)** for Apple Silicon Macs (M1 or later). No Rust installation or build tools needed.
 
-```sh
-sh scripts/build-app.sh
-```
+1. Download `ChooBro-<version>-macos-arm64.dmg` from the release's **Assets** section and open it.
+2. Drag **ChooBro** to **Applications**, then eject the disk image.
+3. Open ChooBro from Applications and click **Make Default Browser…** in Settings.
+4. Approve the macOS prompts, then click a web link in another app and choose a browser.
 
-1. Copy `dist/ChooBro.app` to your **Applications** folder.
-2. Open ChooBro, then click **Make Default Browser…** in Settings.
-3. Approve the macOS prompts.
-4. Click a web link in another app and choose a browser.
+**Early preview:** the app is ad-hoc signed, not Developer ID signed or notarized by Apple. macOS may block it on first launch. If you trust the download, try opening it, then use **System Settings → Privacy & Security → Open Anyway** if macOS offers it. See [Apple's guidance](https://support.apple.com/en-us/102445). Don't disable your Mac's security protections globally.
 
-The build targets your Mac's processor and macOS 12 or later. Testing has focused on Apple Silicon; older macOS versions and Intel Macs haven't been verified. The app is locally signed, not notarized, so macOS may require you to approve opening it.
+Downloads currently support Apple Silicon only. The deployment target is macOS 12 or later, but older macOS versions haven't been fully tested.
+
+To update, quit ChooBro before replacing the copy in Applications. Browser preferences are preserved.
 
 ## Choose a browser
 
@@ -60,3 +60,13 @@ Your selected browser loads the destination and applies its own privacy settings
 ## License
 
 [MIT](LICENSE)
+
+## Build from source
+
+On a Mac with [Rust](https://rustup.rs/), Python 3, and Xcode Command Line Tools installed:
+
+```sh
+sh scripts/build-app.sh
+```
+
+The app is created at `dist/ChooBro.app`. On Apple Silicon, `sh scripts/build-dmg.sh` also creates a DMG and SHA-256 checksum.

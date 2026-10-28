@@ -1,0 +1,22 @@
+ChooBro — Early Preview
+
+For Apple Silicon Macs (M1 or later). Built for macOS 12 or later; compatibility with older macOS versions is not yet fully tested. Intel Macs are not supported by this download.
+
+Install
+
+1. Open the ChooBro DMG.
+2. Drag ChooBro to Applications. If updating, quit the existing copy first.
+3. Eject the disk image and open ChooBro from Applications.
+4. In ChooBro Settings, click Make Default Browser and approve the macOS prompts.
+
+Security notice
+
+This early preview is ad-hoc signed, not Developer ID signed or notarized by Apple. macOS may block it on first launch. Only proceed if you trust this release and its source.
+
+After attempting to open the app, macOS may offer Open Anyway under System Settings > Privacy & Security. Do not disable Gatekeeper or your Mac's security protections globally. Managed Macs may not permit this override.
+
+Apple's explanation: https://support.apple.com/en-us/102445
+
+The accompanying .dmg.sha256 file can be used to check download integrity with: shasum -a 256 -c ChooBro-<version>-macos-arm64.dmg.sha256
+
+Before deleting or moving ChooBro, choose another default browser in macOS System Settings.
