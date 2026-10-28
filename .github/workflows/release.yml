@@ -38,6 +38,7 @@ jobs:
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
+          ruby scripts/test-update-cask.rb
       - name: Build and verify DMG
         run: |
           sh scripts/build-dmg.sh
@@ -54,3 +55,11 @@ jobs:
             --notes-file resources/INSTALL.txt \
             dist/*.dmg dist/*.dmg.sha256
           gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
+      - name: Update Homebrew cask
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ChooBro.app/Contents/Info.plist)
+          checksum=$(shasum -a 256 "dist/ChooBro-$version-macos-arm64.dmg" | awk '{print $1}')
+          ruby scripts/update-cask.rb "$version" "$checksum"

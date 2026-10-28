@@ -9,6 +9,13 @@ Install
 3. Eject the disk image and open ChooBro from Applications.
 4. In ChooBro Settings, click Make Default Browser and approve the macOS prompts.
 
+Alternative: Homebrew
+
+brew tap miguelcaravantes/choobro https://github.com/miguelcaravantes/choobro
+brew install --cask miguelcaravantes/choobro/choobro
+
+This custom cask removes the quarantine attribute only from ChooBro.app to avoid its quarantine-triggered first-launch warning. It does not disable Gatekeeper globally or make the app Apple-verified. Only use this installation route if you trust the project. Quit and remove any manually installed copy before switching to Homebrew; preferences are stored separately.
+
 Security notice
 
 This early preview is ad-hoc signed, not Developer ID signed or notarized by Apple. macOS may block it on first launch. Only proceed if you trust this release and its source.

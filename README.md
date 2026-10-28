@@ -18,6 +18,30 @@ Built in Rust with a native macOS interface.
 
 ## Get started
 
+### Homebrew
+
+For Apple Silicon Macs with [Homebrew](https://brew.sh/) installed:
+
+```sh
+brew tap miguelcaravantes/choobro https://github.com/miguelcaravantes/choobro
+brew install --cask miguelcaravantes/choobro/choobro
+```
+
+Open ChooBro from Applications, click **Make Default Browser…** in Settings, and approve the macOS prompts.
+
+**Security tradeoff:** ChooBro is not notarized by Apple. This custom cask removes the `com.apple.quarantine` attribute only from ChooBro's app bundle to avoid its quarantine-triggered first-launch warning. It does not disable Gatekeeper globally or make the app Apple-verified. Install this way only if you trust the project; managed Macs may still block it.
+
+If you already installed ChooBro manually, quit it before switching to Homebrew. Homebrew may ask you to remove the existing copy from Applications first; browser preferences are stored separately.
+
+To update, quit ChooBro, then run:
+
+```sh
+brew update
+brew upgrade --cask miguelcaravantes/choobro/choobro
+```
+
+### DMG download
+
 **[Download the preview DMG](https://github.com/miguelcaravantes/choobro/releases)** for Apple Silicon Macs (M1 or later). No Rust installation or build tools needed.
 
 1. Download `ChooBro-<version>-macos-arm64.dmg` from the release's **Assets** section and open it.
