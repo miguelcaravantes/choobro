@@ -1,80 +1,62 @@
 # ChooBro
 
-**Choose Browser.** A small, native macOS browser chooser written in Rust.
+**Choose Browser.** Pick which browser opens each link on your Mac.
 
-Open source under the [MIT license](LICENSE). Repository: [miguelcaravantes/choobro](https://github.com/miguelcaravantes/choobro).
+Keep work links in your work browser and personal links in your personal browser. When you click a link in an app that uses your default browser, ChooBro shows your installed browsers and lets you choose where it opens.
 
-Use one browser for development and another for personal browsing? ChooBro lets you choose where a link opens instead of sending every link to the same browser.
+Built in Rust with a native macOS interface.
 
-## How it works
+## Features
 
-1. Install `ChooBro.app` and approve making it the default browser.
-2. Click an HTTP or HTTPS link in Teams, WhatsApp, or another app that uses the system default browser.
-3. Choose an installed browser from a compact native window.
-4. ChooBro forwards the link directly to that browser.
+- Choose a browser for each link instead of sending everything to one default.
+- Discover installed browsers automatically, with their names and icons.
+- Hide browsers you don't want in the chooser.
+- Navigate with the keyboard or mouse.
+- Keep multiple incoming requests queued without losing the link you're choosing for.
+- Read long links in a compact, wrapping preview.
+- Follow your Mac's light or dark appearance.
 
-Settings let you exclude browsers from the chooser. Exclusion only affects ChooBro; it does not uninstall or change those browsers. A **CB** menu-bar item provides Settings, Show Pending Links, and Quit.
+## Get started
 
-## Status
-
-An early runnable prototype, built with **Rust + AppKit through `objc2`**: real macOS controls, no HTML or WebView. Not a production release; performance, supported-OS compatibility, and real browser handoff still need broader verification.
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the research, tradeoffs, and implementation sequence.
-
-## Build and run
-
-Requires macOS, Xcode or its Command Line Tools, and Rust installed through [rustup](https://rustup.rs/). The repository pins Rust 1.91.1 and targets the host CPU architecture.
+ChooBro is an early preview. For now, build it from source on a Mac with [Rust](https://rustup.rs/) and Xcode Command Line Tools installed:
 
 ```sh
 sh scripts/build-app.sh
-open dist/ChooBro.app
 ```
 
-This creates an ad-hoc-signed development bundle at `dist/ChooBro.app`. It does not install the app or change your default browser. Quit and reopen ChooBro after rebuilding to load the new executable; rebuilding does not restart a running copy or discard its pending links.
+1. Copy `dist/ChooBro.app` to your **Applications** folder.
+2. Open ChooBro, then click **Make Default Browser…** in Settings.
+3. Approve the macOS prompts.
+4. Click a web link in another app and choose a browser.
 
-To try a link without changing your default browser:
+The build targets your Mac's processor and macOS 12 or later. Testing has focused on Apple Silicon; older macOS versions and Intel Macs haven't been verified. The app is locally signed, not notarized, so macOS may require you to approve opening it.
 
-```sh
-open -a "$PWD/dist/ChooBro.app" 'https://example.com'
-```
+## Choose a browser
 
-Choose a row with the arrow keys and press Return, double-click a browser, or click Open. Escape or the close button cancels the current request. Links received together open in the same browser; later requests queue rather than replace the current selection.
+- Select a browser and click **Open**, or double-click its row.
+- Use **↑** and **↓** to choose, then **Return** to open.
+- Press **Escape** or close the chooser to cancel the current request.
 
-Long URLs wrap across up to three preview lines without widening the chooser. The original URL is forwarded unchanged and remains available in the preview tooltip.
+If an app sends several links together, they open in the same browser. Links arriving afterward wait for their own selection. Hover over the URL preview to see the full link; ChooBro forwards the original URL without rewriting it.
 
-For regular use, quit the development copy, copy `ChooBro.app` to Applications, reopen that copy, then use **Make Default Browser…** in Settings. This explicitly requests macOS approval for HTTP and HTTPS and reports their current handlers separately. Do not delete or move the default app without first choosing another default browser.
+## Settings
 
-## Development checks
+Click **CB** in the menu bar to open **Settings**, show pending links, or quit ChooBro.
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo run --example native-smoke
-```
-
-The native smoke check requires a logged-in graphical macOS session. It briefly shows its own test windows, checks pre-launch/warm URL callbacks, layout, queued requests, stable selection, failure/retry state, cancellation, and long-URL wrapping with bounded window geometry, then exits. It does not launch a browser, save preference changes, or change defaults. Native view snapshots are saved to `target/native-chooser.png`, `target/native-settings.png`, and `target/native-long-url.png`.
-
-Actual browser handoff, Teams/WhatsApp behavior, VoiceOver, keyboard behavior, denied/partial default changes, cold-launch timing, and older macOS versions still need end-to-end checks. The development bundle is not Developer ID signed or notarized.
-
-## Prototype capabilities
-
-- Receive HTTP and HTTPS links as the user-approved default browser.
-- Discover locally installed, registered web-link handlers rather than maintain a hard-coded browser list. macOS may also return non-browser apps; exclude those in Settings.
-- Show browser names and icons, with mouse and keyboard selection.
-- Remember browser exclusions in native macOS preferences.
-- Use native controls, semantic colors, system fonts, and native accessibility semantics; VoiceOver verification is still pending.
-- Stay lightweight and do no work while idle beyond the native event loop.
-
-Deployment target: macOS 12 or later. Initial checks ran on Apple Silicon with macOS 27.0.1. Older macOS and Intel support require separate verification before being advertised as tested.
-
-## Important limits
-
-- Apps can bypass the default browser by opening an embedded browser, a named browser, or a proprietary URL scheme. ChooBro cannot intercept those without integration from the source app.
-- Installing ChooBro does not silently make it the default browser. macOS controls approval, and the user can change the default later in System Settings.
-- Browser profiles, private windows, domain rules, link rewriting, and cloud sync are not part of the first release.
-- ChooBro is a dispatcher, not a browser engine. Browser launch and page-load time are outside its control.
+Checked browsers appear in the chooser. Uncheck any you want to hide; this doesn't uninstall them or change their settings. Click **Refresh** after installing or removing a browser. macOS may also list other apps that handle web links—you can hide those too.
 
 ## Privacy
 
-ChooBro works locally: no telemetry, network requests, or browsing-history storage. Only browser preferences are saved. URLs remain in memory until dispatched or canceled; they are not logged or persisted. Quitting discards pending links after confirmation. The selected browser, not ChooBro, loads the destination.
+ChooBro works locally. It doesn't collect telemetry, make network requests, or save your browsing history. Only browser preferences are stored. Pending links stay in memory until opened or canceled; quitting discards them after confirmation.
+
+Your selected browser loads the destination and applies its own privacy settings.
+
+## Limitations
+
+- ChooBro handles HTTP and HTTPS links sent to the system default browser. It cannot intercept links an app opens in an embedded browser or forces into a specific browser.
+- Browser profiles, private windows, and automatic routing rules aren't supported yet.
+- Before moving or deleting ChooBro, choose another default browser in macOS System Settings so your links continue to open normally.
+
+## License
+
+[MIT](LICENSE)
