@@ -18,7 +18,9 @@ Built in Rust with a native macOS interface.
 
 ## Get started
 
-### Homebrew
+### Homebrew (preferred)
+
+Homebrew is the preferred installation method for this early preview: it avoids the manual macOS approval normally required by the unnotarized DMG download and makes updates easier. This convenience uses the app-specific quarantine workaround explained below—not Apple notarization.
 
 For Apple Silicon Macs with a current version of [Homebrew](https://brew.sh/) installed:
 
@@ -43,7 +45,9 @@ brew update
 brew upgrade --cask miguelcaravantes/choobro/choobro
 ```
 
-### DMG download
+### DMG download (manual installation)
+
+Use this alternative if you don't use Homebrew. Because ChooBro isn't Developer ID signed or notarized yet, macOS may block the app and require you to approve it manually in **System Settings → Privacy & Security**.
 
 **[Download the preview DMG](https://github.com/miguelcaravantes/choobro/releases)** for Apple Silicon Macs (M1 or later). No Rust installation or build tools needed.
 
