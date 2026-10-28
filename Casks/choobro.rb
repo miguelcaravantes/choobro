@@ -15,11 +15,4 @@ cask "choobro" do
   postflight_steps do
     run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{appdir}}/ChooBro.app"]
   end
-
-  caveats <<~EOS
-    ChooBro is an early preview and is not notarized by Apple.
-    This cask removes the quarantine attribute only from ChooBro.app,
-    bypassing its quarantine-triggered first-launch warning.
-    Install only if you trust this project. Gatekeeper is not disabled globally.
-  EOS
 end
