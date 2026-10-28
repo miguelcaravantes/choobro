@@ -39,6 +39,11 @@ mod app {
                     assert!(state.ready.get());
                     let chooser = state.chooser.get().unwrap();
                     assert!(chooser.window.isVisible());
+                    assert!(
+                        chooser.window.accessibilityCloseButton().is_none(),
+                        "the accessory chooser must be a transient popup for window managers"
+                    );
+                    assert!(chooser.cancel.isEnabled());
                     assert!(state.settings.borrow().is_none());
                     delegate.cancel_request(sel!(cancelRequest:), None);
                     delegate.show_settings(sel!(showSettings:), None);
@@ -46,6 +51,7 @@ mod app {
                         let settings = state.settings.borrow();
                         let settings = settings.as_ref().unwrap();
                         assert!(settings.window.isVisible());
+                        assert!(settings.window.accessibilityCloseButton().is_some());
                         let content = settings.window.contentView().unwrap();
                         assert!(
                             content.wantsLayer(),
@@ -98,7 +104,20 @@ mod app {
                     assert!(state.requests.borrow_mut().begin().is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.open.isEnabled());
+                    assert!(state.requests.borrow().in_flight);
+                    assert!(state.requests.borrow().current().is_some());
+                    assert!(
+                        !chooser.window.isVisible(),
+                        "dismiss the chooser before asking macOS to activate the browser"
+                    );
+                    delegate.refresh_chooser(true);
+                    assert!(
+                        !chooser.window.isVisible(),
+                        "an in-flight handoff must not present the chooser again"
+                    );
                     delegate.dispatch_finished(false, "Test Browser");
+                    assert!(chooser.window.isVisible());
+                    assert!(chooser.open.isEnabled());
                     assert_eq!(chooser.table.selectedRow(), selected);
                     assert!(
                         chooser
@@ -108,9 +127,15 @@ mod app {
                             .contains("Could not open Test Browser")
                     );
                     assert!(state.requests.borrow_mut().begin().is_some());
+                    delegate.set_busy(true);
+                    assert!(!chooser.window.isVisible());
                     delegate.dispatch_finished(true, "Test Browser");
                     assert!(state.requests.borrow().current().is_some());
-                    delegate.cancel_request(sel!(cancelRequest:), None);
+                    assert!(chooser.window.isVisible());
+                    assert!(state.requests.borrow_mut().begin().is_some());
+                    delegate.set_busy(true);
+                    assert!(!chooser.window.isVisible());
+                    delegate.dispatch_finished(true, "Test Browser");
                     assert!(state.requests.borrow().current().is_none());
                     assert!(!chooser.window.isVisible());
                     assert!(chooser.preview.stringValue().is_empty());

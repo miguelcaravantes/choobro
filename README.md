@@ -66,7 +66,7 @@ To update, quit ChooBro before replacing the copy in Applications. Browser prefe
 
 - Select a browser and click **Open**, or double-click its row.
 - Use **↑** and **↓** to choose, then **Return** to open.
-- Press **Escape** or close the chooser to cancel the current request.
+- Press **Escape** or click **Cancel** to cancel the current request.
 
 If an app sends several links together, they open in the same browser. Links arriving afterward wait for their own selection. Hover over the URL preview to see the full link; ChooBro forwards the original URL without rewriting it.
 

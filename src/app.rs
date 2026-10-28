@@ -324,6 +324,7 @@ impl Delegate {
             chooser.cancel.setEnabled(!busy);
             chooser.table.setEnabled(!busy);
             if busy {
+                chooser.window.orderOut(None);
                 chooser
                     .message
                     .setStringValue(ns_string!("Opening in your browser…"));

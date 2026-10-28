@@ -120,6 +120,7 @@ fn fill_width(view: &NSView, root: &NSView) {
 pub fn chooser(target: &Delegate) -> Chooser {
     let mtm = target.mtm();
     let (window, root) = window("Choose Browser", 480.0, 400.0, target);
+    window.setStyleMask(NSWindowStyleMask::Titled);
     let heading = label("Open with…", mtm);
     heading.setFont(Some(&NSFont::boldSystemFontOfSize(20.0)));
     root.addArrangedSubview(&heading);
