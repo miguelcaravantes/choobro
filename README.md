@@ -25,9 +25,9 @@ Homebrew is the preferred installation method for this early preview: it avoids 
 For Apple Silicon Macs with a current version of [Homebrew](https://brew.sh/) installed:
 
 ```sh
-brew tap miguelcaravantes/choobro https://github.com/miguelcaravantes/choobro
-brew trust --cask miguelcaravantes/choobro/choobro
-brew install --cask miguelcaravantes/choobro/choobro
+brew tap miguelcaravantes/tap
+brew trust --cask miguelcaravantes/tap/choobro
+brew install --cask miguelcaravantes/tap/choobro
 ```
 
 Homebrew 7 requires the explicit cask trust step. If `brew trust` isn't available, update Homebrew before continuing.
@@ -42,8 +42,12 @@ To update, quit ChooBro, then run:
 
 ```sh
 brew update
-brew upgrade --cask miguelcaravantes/choobro/choobro
+brew upgrade --cask miguelcaravantes/tap/choobro
 ```
+
+The [new tap](https://github.com/miguelcaravantes/homebrew-tap) currently provides v0.1.2; automatic release updates are not connected yet.
+
+**Existing Homebrew users:** if you installed from `miguelcaravantes/choobro/choobro`, keep using `brew upgrade --cask miguelcaravantes/choobro/choobro` for now. The original tap remains available and receives automated release updates. Do not install a second copy from the new tap; migration instructions will follow.
 
 ### DMG download (manual installation)
 
