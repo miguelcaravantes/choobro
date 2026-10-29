@@ -1,6 +1,6 @@
 [package]
 name = "choobro"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -17,7 +17,7 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std", "block2", "objc2-core-foundation", "NSAccessibility", "NSAccessibilityProtocols", "NSAlert", "NSApplication", "NSButton",
     "NSBitmapImageRep", "NSImageRep", "NSCell", "NSColor", "NSControl", "NSEvent", "NSFont", "NSImage", "NSImageView",
-    "NSLayoutConstraint", "NSLayoutAnchor", "NSMenu", "NSMenuItem", "NSParagraphStyle", "NSResponder",
+    "NSLayoutConstraint", "NSLayoutAnchor", "NSMenu", "NSMenuItem", "NSParagraphStyle", "NSPasteboard", "NSResponder",
     "NSRunningApplication", "NSScrollView", "NSClipView", "NSStackView",
     "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSTableCellView",
     "NSTableColumn", "NSTableView", "NSTableHeaderView", "NSText", "NSTextField", "NSUserInterfaceLayout",

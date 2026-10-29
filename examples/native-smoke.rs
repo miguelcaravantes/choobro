@@ -44,6 +44,12 @@ mod app {
                         "the accessory chooser must be a transient popup for window managers"
                     );
                     assert!(chooser.cancel.isEnabled());
+                    assert_eq!(chooser.copy.action(), Some(sel!(copyLink:)));
+                    assert_eq!(chooser.copy.keyEquivalent().to_string(), "c");
+                    assert_eq!(
+                        chooser.copy.keyEquivalentModifierMask(),
+                        NSEventModifierFlags::Command
+                    );
                     assert!(!chooser.window.isReleasedWhenClosed());
                     assert!(chooser.window.contentViewController().is_some());
                     assert_eq!(chooser.open.action(), Some(sel!(openBrowser:)));
@@ -70,6 +76,33 @@ mod app {
                         );
                         content.layoutSubtreeIfNeeded();
                         assert!(content.frame().size.height > 0.0);
+                        let root = content
+                            .subviews()
+                            .objectAtIndex(0)
+                            .downcast::<NSStackView>()
+                            .unwrap();
+                        let scroll = root
+                            .arrangedSubviews()
+                            .iter()
+                            .find_map(|view| view.downcast::<NSScrollView>().ok())
+                            .unwrap();
+                        let list = scroll
+                            .documentView()
+                            .unwrap()
+                            .downcast::<NSStackView>()
+                            .unwrap();
+                        for view in list.arrangedSubviews() {
+                            let rect = view.alignmentRectForFrame(view.frame());
+                            assert!(rect.origin.x >= 11.9);
+                            assert!(rect.origin.y >= 11.9);
+                            assert!(
+                                rect.origin.x + rect.size.width <= list.bounds().size.width - 11.9
+                            );
+                            assert!(
+                                rect.origin.y + rect.size.height
+                                    <= list.bounds().size.height - 11.9
+                            );
+                        }
                         snapshot(&content, ns_string!("target/native-settings.png"));
                         settings.window.close();
                         assert!(!settings.window.isVisible());
@@ -120,6 +153,7 @@ mod app {
                     assert!(state.requests.borrow_mut().begin().is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.open.isEnabled());
+                    assert!(!chooser.copy.isEnabled());
                     assert!(state.requests.borrow().in_flight);
                     assert!(state.requests.borrow().current().is_some());
                     assert!(
@@ -134,6 +168,7 @@ mod app {
                     delegate.dispatch_finished(false, "Test Browser");
                     assert!(chooser.window.isVisible());
                     assert!(chooser.open.isEnabled());
+                    assert!(chooser.copy.isEnabled());
                     assert_eq!(chooser.table.selectedRow(), selected);
                     assert!(
                         chooser
@@ -188,6 +223,24 @@ mod app {
                     );
                     assert!(!chooser.preview.cell().unwrap().usesSingleLineMode());
                     assert!(chooser.preview.cell().unwrap().wraps());
+                    assert!(chooser.preview.cell().unwrap().truncatesLastVisibleLine());
+                    assert!(!chooser.preview.isSelectable());
+                    assert!(!chooser.preview.isEditable());
+                    assert!(!chooser.preview.acceptsFirstResponder());
+                    assert_eq!(chooser.preview.maximumNumberOfLines(), 3);
+                    assert_eq!(chooser.preview.toolTip().unwrap().to_string(), long_url);
+                    assert_eq!(chooser.preview.stringValue().to_string(), long_url);
+                    let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+                    delegate.copy_link_to(&pasteboard);
+                    assert_eq!(
+                        pasteboard
+                            .stringForType(ns_string!("public.utf8-plain-text"))
+                            .unwrap()
+                            .to_string(),
+                        long_url
+                    );
+                    assert_eq!(chooser.message.stringValue().to_string(), "Link copied.");
+                    assert!(!state.requests.borrow().in_flight);
                     assert_eq!(
                         state
                             .requests
@@ -207,8 +260,25 @@ mod app {
                         open_frame.origin.x + open_frame.size.width <= content.frame().size.width
                     );
                     assert!(open_frame.origin.y >= 0.0);
+                    let copy_frame = chooser
+                        .copy
+                        .convertRect_toView(chooser.copy.bounds(), Some(&content));
+                    assert!(copy_frame.origin.x >= 0.0);
+                    assert!(
+                        copy_frame.origin.x + copy_frame.size.width <= content.frame().size.width
+                    );
+                    assert!(copy_frame.origin.y >= 0.0);
                     snapshot(&content, ns_string!("target/native-long-url.png"));
                     delegate.cancel_request(sel!(cancelRequest:), None);
+                    delegate.copy_link_to(&pasteboard);
+                    assert_eq!(
+                        pasteboard
+                            .stringForType(ns_string!("public.utf8-plain-text"))
+                            .unwrap()
+                            .to_string(),
+                        long_url
+                    );
+                    pasteboard.clearContents();
                     println!(
                         "Native smoke test passed: pre-launch and warm URL callbacks, settings, chooser layout, stable selection, failure/retry, queue, cancellation, long-URL wrapping and bounded window geometry. Snapshots: target/native-chooser.png, target/native-settings.png and target/native-long-url.png"
                     );

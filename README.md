@@ -45,7 +45,7 @@ brew update
 brew upgrade --cask miguelcaravantes/tap/choobro
 ```
 
-The [new tap](https://github.com/miguelcaravantes/homebrew-tap) currently provides v0.1.2; automatic release updates are not connected yet.
+The cask is maintained in [miguelcaravantes/homebrew-tap](https://github.com/miguelcaravantes/homebrew-tap).
 
 ### DMG download (manual installation)
 
@@ -69,6 +69,7 @@ To update, quit ChooBro before replacing the copy in Applications. Browser prefe
 - Select a browser and click **Open**, or double-click its row.
 - Use **↑** and **↓** to choose, then **Return** to open.
 - Press **Escape** or click **Cancel** to cancel the current request.
+- Click **Copy Link** or press **⌘C** to copy the full displayed link, even when its preview ends in an ellipsis. Copying keeps the chooser open and does not discard pending links.
 
 If an app sends several links together, they open in the same browser. Links arriving afterward wait for their own selection. Hover over the URL preview to see the full link; ChooBro forwards the original URL without rewriting it.
 

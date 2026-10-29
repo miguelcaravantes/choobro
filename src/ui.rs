@@ -5,7 +5,9 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::*;
-use objc2_foundation::{MainThreadMarker, NSArray, NSObjectProtocol, NSSize, NSString, ns_string};
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSEdgeInsets, NSObjectProtocol, NSSize, NSString, ns_string,
+};
 
 use crate::{app::Delegate, browsers::Browser};
 
@@ -28,6 +30,7 @@ pub struct Chooser {
     pub window: Retained<NSWindow>,
     pub table: Retained<NSTableView>,
     pub preview: Retained<NSTextField>,
+    pub copy: Retained<NSButton>,
     pub message: Retained<NSTextField>,
     pub open: Retained<NSButton>,
     pub cancel: Retained<NSButton>,
@@ -61,6 +64,7 @@ fn stack(mtm: MainThreadMarker, vertical: bool) -> Retained<NSStackView> {
 }
 
 enum ButtonAction {
+    CopyLink,
     Settings,
     Cancel,
     Open,
@@ -70,6 +74,7 @@ enum ButtonAction {
 impl ButtonAction {
     fn selector(&self) -> Sel {
         match self {
+            Self::CopyLink => sel!(copyLink:),
             Self::Settings => sel!(showSettings:),
             Self::Cancel => sel!(cancelRequest:),
             Self::Open => sel!(openBrowser:),
@@ -134,12 +139,25 @@ pub fn chooser(target: &Delegate) -> Chooser {
     window.setStyleMask(NSWindowStyleMask::Titled);
     let heading = label("Open with…", mtm);
     heading.setFont(Some(&NSFont::boldSystemFontOfSize(20.0)));
-    root.addArrangedSubview(&heading);
+    let header = stack(mtm, false);
+    header.addArrangedSubview(&heading);
+    header.addArrangedSubview(&NSView::new(mtm));
+    let copy = button("Copy Link", ButtonAction::CopyLink, target);
+    copy.setToolTip(Some(ns_string!("Copy the full displayed link")));
+    copy.setKeyEquivalent(ns_string!("c"));
+    copy.setKeyEquivalentModifierMask(NSEventModifierFlags::Command);
+    header.addArrangedSubview(&copy);
+    root.addArrangedSubview(&header);
+    fill_width(&header, &root);
     let preview = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
-    preview.setSelectable(true);
+    preview.setSelectable(false);
     preview.setPreferredMaxLayoutWidth(432.0);
     preview.setLineBreakMode(NSLineBreakMode::ByCharWrapping);
     preview.setMaximumNumberOfLines(3);
+    preview
+        .cell()
+        .expect("URL preview cell")
+        .setTruncatesLastVisibleLine(true);
     root.addArrangedSubview(&preview);
     fill_width(&preview, &root);
 
@@ -193,6 +211,7 @@ pub fn chooser(target: &Delegate) -> Chooser {
         window,
         table,
         preview,
+        copy,
         message,
         open,
         cancel,
@@ -246,6 +265,12 @@ pub fn settings(
     list.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     list.setAlignment(NSLayoutAttribute::Leading);
     list.setSpacing(12.0);
+    list.setEdgeInsets(NSEdgeInsets {
+        top: 12.0,
+        left: 12.0,
+        bottom: 12.0,
+        right: 12.0,
+    });
     list.setTranslatesAutoresizingMaskIntoConstraints(false);
     for (index, browser) in browsers.iter().enumerate() {
         let toggle = unsafe {

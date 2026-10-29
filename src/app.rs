@@ -143,6 +143,11 @@ define_class!(
     }
 
     impl Delegate {
+        #[unsafe(method(copyLink:))]
+        fn copy_link(&self, _sender: Option<&AnyObject>) {
+            self.copy_link_to(&NSPasteboard::generalPasteboard());
+        }
+
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
             let browsers = browsers::discover(&BTreeSet::from(["http".into(), "https".into()]));
@@ -232,6 +237,25 @@ define_class!(
 );
 
 impl Delegate {
+    fn copy_link_to(&self, pasteboard: &NSPasteboard) {
+        let url = self
+            .ivars()
+            .requests
+            .borrow()
+            .current()
+            .and_then(|urls| urls.objectAtIndex(0).absoluteString());
+        let Some(url) = url else { return };
+        pasteboard.clearContents();
+        let copied = pasteboard.setString_forType(&url, ns_string!("public.utf8-plain-text"));
+        if let Some(chooser) = self.ivars().chooser.get() {
+            chooser.message.setStringValue(if copied {
+                ns_string!("Link copied.")
+            } else {
+                ns_string!("Could not copy the link. Try again.")
+            });
+        }
+    }
+
     fn unsupported_link(&self) {
         ui::alert(
             "Unsupported link",
@@ -318,6 +342,7 @@ impl Delegate {
 
     fn set_busy(&self, busy: bool) {
         if let Some(chooser) = self.ivars().chooser.get() {
+            chooser.copy.setEnabled(!busy);
             chooser
                 .open
                 .setEnabled(!busy && !self.ivars().browsers.borrow().is_empty());
