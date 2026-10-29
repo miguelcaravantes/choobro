@@ -10,6 +10,10 @@ on:
         description: Existing version tag to release
         required: true
         type: string
+      update_tap_only:
+        description: Update the tap from an already published release without rebuilding it
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -30,7 +34,7 @@ jobs:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.update_tap_only && 'main' || inputs.tag || github.ref }}
           persist-credentials: false
       - name: Check code
         run: |
@@ -39,12 +43,22 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
           ruby scripts/test-update-cask.rb
+      - name: Check Homebrew deploy key
+        env:
+          HOMEBREW_TAP_SSH_KEY: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+        run: |
+          if [ -z "$HOMEBREW_TAP_SSH_KEY" ]; then
+            echo "::error::Configure the HOMEBREW_TAP_SSH_KEY Actions secret before releasing."
+            exit 1
+          fi
       - name: Build and verify DMG
+        if: ${{ !inputs.update_tap_only }}
         run: |
           sh scripts/build-dmg.sh
           version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ChooBro.app/Contents/Info.plist)
           test "$RELEASE_TAG" = "v$version"
       - name: Publish preview release
+        if: ${{ !inputs.update_tap_only }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -55,11 +69,34 @@ jobs:
             --notes-file resources/INSTALL.txt \
             dist/*.dmg dist/*.dmg.sha256
           gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
-      - name: Update Homebrew cask
+      - name: Check out Homebrew tap
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: miguelcaravantes/homebrew-tap
+          ref: main
+          path: .homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_SSH_KEY }}
+      - name: Verify published DMG and update Homebrew tap
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          version=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' dist/ChooBro.app/Contents/Info.plist)
-          checksum=$(shasum -a 256 "dist/ChooBro-$version-macos-arm64.dmg" | awk '{print $1}')
-          ruby scripts/update-cask.rb "$version" "$checksum"
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          version="${RELEASE_TAG#v}"
+          published="$RUNNER_TEMP/published-dmg"
+          mkdir -p "$published"
+          gh release download "$RELEASE_TAG" --pattern "ChooBro-$version-macos-arm64.dmg*" --dir "$published"
+          checksum=$(shasum -a 256 "$published/ChooBro-$version-macos-arm64.dmg" | awk '{print $1}')
+          expected=$(awk '{print $1}' "$published/ChooBro-$version-macos-arm64.dmg.sha256")
+          test "$checksum" = "$expected"
+          hdiutil verify "$published/ChooBro-$version-macos-arm64.dmg"
+          ruby scripts/update-cask.rb "$version" "$checksum" .homebrew-tap/Casks/choobro.rb
+          if git -C .homebrew-tap diff --quiet -- Casks/choobro.rb; then
+            echo "Homebrew tap already contains this version or a newer release."
+            exit 0
+          fi
+          git -C .homebrew-tap config --local user.name 'github-actions[bot]'
+          git -C .homebrew-tap config --local user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C .homebrew-tap add Casks/choobro.rb
+          git -C .homebrew-tap commit -m "Update ChooBro to $version"
+          git -C .homebrew-tap push origin HEAD:main
