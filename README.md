@@ -6,6 +6,8 @@ Work in Chrome. Personal browsing in Firefox. A link arrives from Teams—why sh
 
 ChooBro (**Choose Browser**) lets you pick where each link opens, right when you click it.
 
+<img src="docs/images/chooser.png" alt="ChooBro’s native macOS chooser with its window frame, link preview, and installed browsers." width="592">
+
 ## Why ChooBro?
 
 - **Free. Open source. Yours.** No subscription, no account. [MIT licensed](LICENSE).
