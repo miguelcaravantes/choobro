@@ -1,28 +1,25 @@
 # ChooBro
 
-**Choose Browser.** Pick which browser opens each link on your Mac.
+**Your links. Your browser. Your choice.**
 
-Keep work links in your work browser and personal links in your personal browser. When you click a link in an app that uses your default browser, ChooBro shows your installed browsers and lets you choose where it opens.
+Work in Chrome. Personal browsing in Firefox. A link arrives from Teams—why should your default browser decide?
 
-Built in Rust with a native macOS interface.
+ChooBro (**Choose Browser**) lets you pick where each link opens, right when you click it.
 
-## Features
+## Why ChooBro?
 
-- Choose a browser for each link instead of sending everything to one default.
-- Discover installed browsers automatically, with their names and icons.
-- Hide browsers you don't want in the chooser.
-- Navigate with the keyboard or mouse.
-- Keep multiple incoming requests queued without losing the link you're choosing for.
-- Read long links in a compact, wrapping preview.
-- Follow your Mac's light or dark appearance.
+- **Free. Open source. Yours.** No subscription, no account. [MIT licensed](LICENSE).
+- **Native, not a website in a window.** Real macOS controls, system fonts, and light/dark appearance.
+- **Lean by design.** Written in Rust with AppKit. No Electron, WebView, bundled browser engine, or background polling.
+- **Quick to use.** Arrow keys to choose, Return to open. No settings detour for every link.
+- **Your browsers, your rules.** Finds installed browsers automatically. Hide the ones you don't use.
+- **Private by default.** No telemetry, network requests, or browsing history. Links aren't rewritten; only browser preferences are saved.
 
-## Get started
+## Install
 
-### Homebrew (preferred)
+**Apple Silicon · targets macOS 12+ · early preview**
 
-Homebrew is the preferred installation method for this early preview: it avoids the manual macOS approval normally required by the unnotarized DMG download and makes updates easier. This convenience uses the app-specific quarantine workaround explained below—not Apple notarization.
-
-For Apple Silicon Macs with a current version of [Homebrew](https://brew.sh/) installed:
+### Homebrew (recommended)
 
 ```sh
 brew tap miguelcaravantes/tap
@@ -30,77 +27,49 @@ brew trust --cask miguelcaravantes/tap/choobro
 brew install --cask miguelcaravantes/tap/choobro
 ```
 
-Homebrew 7 requires the explicit cask trust step. If `brew trust` isn't available, update Homebrew before continuing.
+Use current Homebrew; update it if `brew trust` is unavailable. The cask lives in [homebrew-tap](https://github.com/miguelcaravantes/homebrew-tap).
 
-Open ChooBro from Applications, click **Make Default Browser…** in Settings, and approve the macOS prompts.
+**Security:** ChooBro is ad-hoc signed, not Developer ID signed or Apple-notarized. The cask removes quarantine only from ChooBro.app to avoid its first-launch warning—not Gatekeeper globally. This does not make it Apple-verified. Managed Macs may block it.
 
-**Security tradeoff:** ChooBro is not notarized by Apple. This custom cask removes the `com.apple.quarantine` attribute only from ChooBro's app bundle to avoid its quarantine-triggered first-launch warning. It does not disable Gatekeeper globally or make the app Apple-verified. Install this way only if you trust the project; managed Macs may still block it.
+### Prefer a download?
 
-If you already installed ChooBro manually, quit it before switching to Homebrew. Homebrew may ask you to remove the existing copy from Applications first; browser preferences are stored separately.
+[Download the DMG](https://github.com/miguelcaravantes/choobro/releases), open it, drag ChooBro to Applications, and eject it. If macOS blocks launch, try opening it first, then use **System Settings → Privacy & Security → Open Anyway** if offered. [Apple's guidance](https://support.apple.com/en-us/102445). Never disable Gatekeeper globally.
 
-To update, quit ChooBro, then run:
+Open ChooBro, click **Make Default Browser…** in Settings, and approve the macOS prompts. You're ready.
+
+## Make it yours
+
+- **Open:** choose a browser and press Return, click Open, or double-click its row.
+- **Cancel:** press Escape or click Cancel.
+- **Copy:** click Copy Link or press ⌘C. You get the full URL, even when the preview ends in an ellipsis; the chooser stays open.
+- **Customize:** click **CB → Settings** in the menu bar to hide browsers or refresh the list.
+
+Links arriving together open in one browser; later requests wait their turn. Pending links stay in memory, not on disk. Quitting asks before discarding them.
+
+## Update
+
+Quit ChooBro, then:
 
 ```sh
 brew update
 brew upgrade --cask miguelcaravantes/tap/choobro
 ```
 
-The cask is maintained in [miguelcaravantes/homebrew-tap](https://github.com/miguelcaravantes/homebrew-tap).
+For DMG installs, replace the app in Applications. Preferences survive updates. Quit and remove a manually installed copy before switching to Homebrew.
 
-### DMG download (manual installation)
+## Good to know
 
-Use this alternative if you don't use Homebrew. Because ChooBro isn't Developer ID signed or notarized yet, macOS may block the app and require you to approve it manually in **System Settings → Privacy & Security**.
-
-**[Download the preview DMG](https://github.com/miguelcaravantes/choobro/releases)** for Apple Silicon Macs (M1 or later). No Rust installation or build tools needed.
-
-1. Download `ChooBro-<version>-macos-arm64.dmg` from the release's **Assets** section and open it.
-2. Drag **ChooBro** to **Applications**, then eject the disk image.
-3. Open ChooBro from Applications and click **Make Default Browser…** in Settings.
-4. Approve the macOS prompts, then click a web link in another app and choose a browser.
-
-**Early preview:** the app is ad-hoc signed, not Developer ID signed or notarized by Apple. macOS may block it on first launch. If you trust the download, try opening it, then use **System Settings → Privacy & Security → Open Anyway** if macOS offers it. See [Apple's guidance](https://support.apple.com/en-us/102445). Don't disable your Mac's security protections globally.
-
-Downloads currently support Apple Silicon only. The deployment target is macOS 12 or later, but older macOS versions haven't been fully tested.
-
-To update, quit ChooBro before replacing the copy in Applications. Browser preferences are preserved.
-
-## Choose a browser
-
-- Select a browser and click **Open**, or double-click its row.
-- Use **↑** and **↓** to choose, then **Return** to open.
-- Press **Escape** or click **Cancel** to cancel the current request.
-- Click **Copy Link** or press **⌘C** to copy the full displayed link, even when its preview ends in an ellipsis. Copying keeps the chooser open and does not discard pending links.
-
-If an app sends several links together, they open in the same browser. Links arriving afterward wait for their own selection. Hover over the URL preview to see the full link; ChooBro forwards the original URL without rewriting it.
-
-## Settings
-
-Click **CB** in the menu bar to open **Settings**, show pending links, or quit ChooBro.
-
-Checked browsers appear in the chooser. Uncheck any you want to hide; this doesn't uninstall them or change their settings. Click **Refresh** after installing or removing a browser. macOS may also list other apps that handle web links—you can hide those too.
-
-## Privacy
-
-ChooBro works locally. It doesn't collect telemetry, make network requests, or save your browsing history. Only browser preferences are stored. Pending links stay in memory until opened or canceled; quitting discards them after confirmation.
-
-Your selected browser loads the destination and applies its own privacy settings.
-
-## Limitations
-
-- ChooBro handles HTTP and HTTPS links sent to the system default browser. It cannot intercept links an app opens in an embedded browser or forces into a specific browser.
-- Browser profiles, private windows, and automatic routing rules aren't supported yet.
-- Before moving or deleting ChooBro, choose another default browser in macOS System Settings so your links continue to open normally.
-
-## License
-
-[MIT](LICENSE)
+- Only HTTP/HTTPS links sent to the system default browser are handled. Embedded or app-forced browsers bypass ChooBro.
+- Browser profiles, private windows, and routing rules aren't supported.
+- Older macOS compatibility, startup speed, and RAM usage haven't been fully verified or benchmarked.
+- Before removing ChooBro, choose another default browser in macOS Settings.
 
 ## Build from source
 
-On a Mac with [Rust](https://rustup.rs/), Python 3, and Xcode Command Line Tools installed:
+With Rust, Python 3, and Xcode Command Line Tools installed:
 
 ```sh
 sh scripts/build-app.sh
 ```
 
-The app is created at `dist/ChooBro.app`. On Apple Silicon, `sh scripts/build-dmg.sh` also creates a DMG and SHA-256 checksum.
+Output: `dist/ChooBro.app`. On Apple Silicon, `sh scripts/build-dmg.sh` also creates a DMG and SHA-256 checksum.
