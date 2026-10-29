@@ -47,8 +47,6 @@ brew upgrade --cask miguelcaravantes/tap/choobro
 
 The [new tap](https://github.com/miguelcaravantes/homebrew-tap) currently provides v0.1.2; automatic release updates are not connected yet.
 
-**Existing Homebrew users:** if you installed from `miguelcaravantes/choobro/choobro`, keep using `brew upgrade --cask miguelcaravantes/choobro/choobro` for now. The original tap remains available and receives automated release updates. Do not install a second copy from the new tap; migration instructions will follow.
-
 ### DMG download (manual installation)
 
 Use this alternative if you don't use Homebrew. Because ChooBro isn't Developer ID signed or notarized yet, macOS may block the app and require you to approve it manually in **System Settings → Privacy & Security**.
