@@ -41,6 +41,7 @@ pub struct Settings {
     pub window: Retained<NSWindow>,
     pub status: Retained<NSTextField>,
     pub make_default: Retained<NSButton>,
+    reorder_buttons: Vec<[Retained<NSButton>; 2]>,
 }
 
 impl Chooser {
@@ -118,6 +119,20 @@ impl Chooser {
 }
 
 impl Settings {
+    pub fn focus_browser_move(&self, index: usize, offset: isize) {
+        if let Some(buttons) = self.reorder_buttons.get(index) {
+            let preferred = usize::from(offset > 0);
+            let button = if buttons[preferred].isEnabled() {
+                &buttons[preferred]
+            } else {
+                &buttons[1 - preferred]
+            };
+            self.window.contentView().unwrap().layoutSubtreeIfNeeded();
+            button.scrollRectToVisible(button.bounds());
+            self.window.makeFirstResponder(Some(button));
+        }
+    }
+
     pub fn set_status(&self, configuring: bool, status: &str) {
         self.make_default.setEnabled(!configuring);
         self.status.setStringValue(&NSString::from_str(status));
@@ -162,6 +177,8 @@ enum ButtonAction {
     Cancel,
     Open,
     MakeDefault,
+    MoveUp,
+    MoveDown,
 }
 
 impl ButtonAction {
@@ -172,6 +189,8 @@ impl ButtonAction {
             Self::Cancel => sel!(cancelRequest:),
             Self::Open => sel!(openBrowser:),
             Self::MakeDefault => sel!(makeDefault:),
+            Self::MoveUp => sel!(moveBrowserUp:),
+            Self::MoveDown => sel!(moveBrowserDown:),
         }
     }
 }
@@ -347,13 +366,28 @@ pub fn settings(
     browsers: &[Browser],
     excluded: &std::collections::BTreeSet<String>,
     configuring: bool,
+    manual: bool,
 ) -> Settings {
     let mtm = target.mtm();
-    let (window, root) = window("ChooBro Settings", 520.0, 440.0, target);
+    let (window, root) = window("ChooBro Settings", 520.0, 480.0, target);
     let heading = label("Choose your browsers", mtm);
     heading.setFont(Some(&NSFont::boldSystemFontOfSize(20.0)));
     root.addArrangedSubview(&heading);
     root.addArrangedSubview(&label("Checked browsers appear when you open a link.", mtm));
+    let sort = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Manual order (unchecked: alphabetical)"),
+            Some(target),
+            Some(sel!(changeBrowserSort:)),
+            mtm,
+        )
+    };
+    sort.setState(if manual {
+        NSControlStateValueOn
+    } else {
+        NSControlStateValueOff
+    });
+    root.addArrangedSubview(&sort);
     let list: Retained<BrowserList> = unsafe { msg_send![BrowserList::alloc(mtm), init] };
     list.setOrientation(NSUserInterfaceLayoutOrientation::Vertical);
     list.setAlignment(NSLayoutAttribute::Leading);
@@ -365,6 +399,7 @@ pub fn settings(
         right: 12.0,
     });
     list.setTranslatesAutoresizingMaskIntoConstraints(false);
+    let mut reorder_buttons = Vec::new();
     for (index, browser) in browsers.iter().enumerate() {
         let toggle = unsafe {
             NSButton::checkboxWithTitle_target_action(
@@ -381,7 +416,33 @@ pub fn settings(
             NSControlStateValueOn
         });
         toggle.setToolTip(Some(&NSString::from_str(&browser.path)));
-        list.addArrangedSubview(&toggle);
+        let row = stack(mtm, false);
+        row.addArrangedSubview(&toggle);
+        row.addArrangedSubview(&NSView::new(mtm));
+        let buttons = [
+            ("↑", ButtonAction::MoveUp, manual && index > 0),
+            (
+                "↓",
+                ButtonAction::MoveDown,
+                manual && index + 1 < browsers.len(),
+            ),
+        ]
+        .map(|(title, action, enabled)| {
+            let move_button = button(title, action, target);
+            move_button.setTag(index as isize);
+            move_button.setEnabled(enabled);
+            let direction = if title == "↑" { "up" } else { "down" };
+            let description = NSString::from_str(&format!("Move {} {direction}", browser.name));
+            move_button.setAccessibilityLabel(Some(&description));
+            move_button.setToolTip(Some(&description));
+            row.addArrangedSubview(&move_button);
+            move_button
+        });
+        reorder_buttons.push(buttons);
+        list.addArrangedSubview(&row);
+        row.widthAnchor()
+            .constraintEqualToAnchor_constant(&list.widthAnchor(), -24.0)
+            .setActive(true);
     }
     if browsers.is_empty() {
         list.addArrangedSubview(&label(
@@ -423,6 +484,7 @@ pub fn settings(
         window,
         status,
         make_default,
+        reorder_buttons,
     }
 }
 

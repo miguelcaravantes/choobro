@@ -113,6 +113,69 @@ mod delegate {
                     }
                     delegate.show_settings(sel!(showSettings:), None);
                     assert!(state.settings.borrow().as_ref().unwrap().window.isVisible());
+                    let browsers: Vec<_> = ["Chrome", "Firefox", "Safari"]
+                        .into_iter()
+                        .map(|name| browsers::Browser {
+                            id: name.into(),
+                            name: name.into(),
+                            path: format!("/Applications/{name}.app"),
+                            url: NSURL::fileURLWithPath(ns_string!("/Applications")),
+                            icon: NSImage::new(),
+                        })
+                        .collect();
+                    for manual in [false, true] {
+                        let settings =
+                            ui::settings(delegate, &browsers, &Default::default(), false, manual);
+                        let content = settings.window.contentView().unwrap();
+                        content.layoutSubtreeIfNeeded();
+                        let root = content
+                            .subviews()
+                            .objectAtIndex(0)
+                            .downcast::<NSStackView>()
+                            .unwrap();
+                        let sort = root
+                            .arrangedSubviews()
+                            .iter()
+                            .find_map(|view| view.downcast::<NSButton>().ok())
+                            .unwrap();
+                        assert_eq!(sort.action(), Some(sel!(changeBrowserSort:)));
+                        assert_eq!(sort.state() == NSControlStateValueOn, manual);
+                        let scroll = root
+                            .arrangedSubviews()
+                            .iter()
+                            .find_map(|view| view.downcast::<NSScrollView>().ok())
+                            .unwrap();
+                        let list = scroll
+                            .documentView()
+                            .unwrap()
+                            .downcast::<NSStackView>()
+                            .unwrap();
+                        for (index, row) in list.arrangedSubviews().iter().enumerate() {
+                            let row = row.downcast::<NSStackView>().unwrap();
+                            let buttons: Vec<_> = row
+                                .arrangedSubviews()
+                                .iter()
+                                .filter_map(|view| view.downcast::<NSButton>().ok())
+                                .collect();
+                            assert_eq!(buttons.len(), 3);
+                            assert_eq!(buttons[0].action(), Some(sel!(toggleBrowser:)));
+                            assert_eq!(buttons[1].action(), Some(sel!(moveBrowserUp:)));
+                            assert_eq!(buttons[2].action(), Some(sel!(moveBrowserDown:)));
+                            assert_eq!(buttons[1].tag(), index as isize);
+                            assert_eq!(buttons[2].tag(), index as isize);
+                            assert_eq!(buttons[1].isEnabled(), manual && index > 0);
+                            assert_eq!(
+                                buttons[2].isEnabled(),
+                                manual && index + 1 < browsers.len()
+                            );
+                            assert!(row.frame().size.width <= list.bounds().size.width - 23.9);
+                        }
+                        if manual {
+                            settings.focus_browser_move(1, 1);
+                            snapshot(&content, ns_string!("target/native-manual-settings.png"));
+                        }
+                        settings.window.close();
+                    }
                     let url = NSURL::URLWithString(ns_string!(
                         "https://example.invalid/a%2Fb?x=a%26b#test"
                     ))

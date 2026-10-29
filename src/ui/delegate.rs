@@ -126,8 +126,12 @@ define_class!(
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
             let (browsers, excluded) = self.ivars().app.refresh_settings();
-            let settings = ui::settings(self, &browsers, &excluded, self.ivars().app.configuring());
-            if let Some(old) = self.ivars().settings.borrow_mut().replace(settings) {
+            let settings = ui::settings(self, &browsers, &excluded, self.ivars().app.configuring(), browsers::manual_order());
+            let old = self.ivars().settings.borrow_mut().replace(settings);
+            if let Some(old) = old {
+                if let Some(settings) = &*self.ivars().settings.borrow() {
+                    settings.window.setFrame_display(old.window.frame(), false);
+                }
                 old.window.orderOut(None);
             }
             if let Some(settings) = &*self.ivars().settings.borrow() {
@@ -150,6 +154,23 @@ define_class!(
                 self.ivars().app.set_browser_enabled(index, sender.state() == NSControlStateValueOn);
             }
             self.refresh_chooser(false);
+        }
+
+        #[unsafe(method(changeBrowserSort:))]
+        fn change_browser_sort(&self, sender: &NSButton) {
+            browsers::set_manual_order(sender.state() == NSControlStateValueOn);
+            self.show_settings(sel!(showSettings:), None);
+            self.refresh_chooser(false);
+        }
+
+        #[unsafe(method(moveBrowserUp:))]
+        fn move_browser_up(&self, sender: &NSButton) {
+            self.move_settings_browser(sender, -1);
+        }
+
+        #[unsafe(method(moveBrowserDown:))]
+        fn move_browser_down(&self, sender: &NSButton) {
+            self.move_settings_browser(sender, 1);
         }
 
         #[unsafe(method(cancelRequest:))]
@@ -203,6 +224,18 @@ define_class!(
 );
 
 impl Delegate {
+    fn move_settings_browser(&self, sender: &NSButton, offset: isize) {
+        if let Ok(index) = usize::try_from(sender.tag())
+            && self.ivars().app.move_browser(index, offset)
+        {
+            self.show_settings(sel!(showSettings:), None);
+            self.refresh_chooser(false);
+            if let Some(settings) = &*self.ivars().settings.borrow() {
+                settings.focus_browser_move(index.checked_add_signed(offset).unwrap(), offset);
+            }
+        }
+    }
+
     fn copy_link_to(&self, pasteboard: &NSPasteboard) {
         let url = self.ivars().app.preview();
         let Some(url) = url else { return };

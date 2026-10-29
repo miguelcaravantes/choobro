@@ -38,6 +38,53 @@ pub fn set_excluded(id: &str, excluded: bool) {
     }
 }
 
+pub fn manual_order() -> bool {
+    NSUserDefaults::standardUserDefaults().boolForKey(ns_string!("ManualBrowserOrder"))
+}
+
+pub fn set_manual_order(manual: bool) {
+    NSUserDefaults::standardUserDefaults().setBool_forKey(manual, ns_string!("ManualBrowserOrder"));
+}
+
+pub fn set_browser_order(browsers: &[Browser]) {
+    let paths: Vec<_> = browsers
+        .iter()
+        .map(|browser| NSString::from_str(&browser.path))
+        .collect();
+    unsafe {
+        NSUserDefaults::standardUserDefaults().setObject_forKey(
+            Some(&NSArray::from_retained_slice(&paths)),
+            ns_string!("BrowserOrder"),
+        );
+    }
+}
+
+fn sort_browsers(browsers: &mut [Browser], order: &[String]) {
+    browsers.sort_by(|a, b| {
+        let rank = |path: &str| {
+            order
+                .iter()
+                .position(|saved| saved == path)
+                .unwrap_or(usize::MAX)
+        };
+        rank(&a.path)
+            .cmp(&rank(&b.path))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+}
+
+pub fn move_browser(browsers: &mut [Browser], index: usize, offset: isize) -> bool {
+    let Some(destination) = index.checked_add_signed(offset) else {
+        return false;
+    };
+    if index >= browsers.len() || destination >= browsers.len() {
+        return false;
+    }
+    browsers.swap(index, destination);
+    true
+}
+
 fn eligible(id: &str, path: &str, own_path: &str) -> bool {
     !id.is_empty() && id != BUNDLE_ID && path != own_path
 }
@@ -108,12 +155,15 @@ pub fn discover(schemes: &BTreeSet<String>) -> Vec<Browser> {
             url,
         });
     }
-    browsers.sort_by(|a, b| {
-        a.name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then(a.path.cmp(&b.path))
-    });
+    let order = if manual_order() {
+        NSUserDefaults::standardUserDefaults()
+            .stringArrayForKey(ns_string!("BrowserOrder"))
+            .map(|values| values.iter().map(|value| value.to_string()).collect())
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    sort_browsers(&mut browsers, &order);
     browsers
 }
 
@@ -183,6 +233,73 @@ pub fn set_default_scheme(index: usize, finished: impl Fn(bool) + Send + 'static
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn browser(name: &str, path: &str) -> Browser {
+        Browser {
+            id: name.into(),
+            name: name.into(),
+            path: path.into(),
+            url: NSURL::fileURLWithPath(&NSString::from_str(path)),
+            icon: NSImage::new(),
+        }
+    }
+
+    #[test]
+    fn alphabetical_order_is_case_insensitive_and_breaks_ties_by_path() {
+        let mut browsers = vec![
+            browser("Safari", "/Safari.app"),
+            browser("chrome", "/Copy.app"),
+            browser("Chrome", "/Chrome.app"),
+        ];
+        sort_browsers(&mut browsers, &[]);
+        assert_eq!(
+            browsers
+                .iter()
+                .map(|browser| browser.path.as_str())
+                .collect::<Vec<_>>(),
+            ["/Chrome.app", "/Copy.app", "/Safari.app"]
+        );
+    }
+
+    #[test]
+    fn manual_order_ignores_missing_browsers_and_appends_new_ones_alphabetically() {
+        let mut browsers = vec![
+            browser("Chrome", "/Chrome.app"),
+            browser("Firefox", "/Firefox.app"),
+            browser("Safari", "/Safari.app"),
+            browser("Brave", "/Brave.app"),
+        ];
+        let order = ["/Missing.app", "/Safari.app", "/Chrome.app"].map(String::from);
+        sort_browsers(&mut browsers, &order);
+        assert_eq!(
+            browsers
+                .iter()
+                .map(|browser| browser.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Safari", "Chrome", "Brave", "Firefox"]
+        );
+        sort_browsers(&mut browsers, &[]);
+        assert_eq!(browsers[0].name, "Brave");
+        sort_browsers(&mut browsers, &order);
+        assert_eq!(browsers[0].name, "Safari");
+    }
+
+    #[test]
+    fn moving_browsers_swaps_neighbors_and_rejects_out_of_bounds_moves() {
+        let mut browsers = vec![
+            browser("Chrome", "/Chrome.app"),
+            browser("Safari", "/Safari.app"),
+        ];
+        assert!(!move_browser(&mut browsers, 0, -1));
+        assert!(!move_browser(&mut browsers, 1, 1));
+        assert!(!move_browser(&mut browsers, usize::MAX, 1));
+        assert!(!move_browser(&mut browsers, 2, -1));
+        assert!(move_browser(&mut browsers, 0, 1));
+        assert_eq!(browsers[0].name, "Safari");
+        assert!(move_browser(&mut browsers, 1, -1));
+        assert_eq!(browsers[0].name, "Chrome");
+        assert!(!move_browser(&mut [], 0, 1));
+    }
 
     #[test]
     fn excludes_self_by_identifier_and_location() {

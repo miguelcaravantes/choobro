@@ -128,6 +128,18 @@ impl App {
         }
     }
 
+    pub fn move_browser(&self, index: usize, offset: isize) -> bool {
+        if !browsers::manual_order() {
+            return false;
+        }
+        let mut browsers = self.settings_browsers.borrow_mut();
+        if !browsers::move_browser(&mut browsers, index, offset) {
+            return false;
+        }
+        browsers::set_browser_order(&browsers);
+        true
+    }
+
     pub fn cancel(&self) {
         self.requests.borrow_mut().cancel();
     }
