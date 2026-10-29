@@ -6,10 +6,11 @@ use objc2::{
 };
 use objc2_app_kit::*;
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSEdgeInsets, NSObjectProtocol, NSSize, NSString, ns_string,
+    MainThreadMarker, NSArray, NSEdgeInsets, NSIndexSet, NSObjectProtocol, NSSize, NSString,
+    ns_string,
 };
 
-use crate::{app::Delegate, browsers::Browser};
+use crate::{app::ChooserContent, browsers::Browser, delegate::Delegate};
 
 define_class!(
     #[unsafe(super = NSStackView)]
@@ -40,6 +41,98 @@ pub struct Settings {
     pub window: Retained<NSWindow>,
     pub status: Retained<NSTextField>,
     pub make_default: Retained<NSButton>,
+}
+
+impl Chooser {
+    pub fn copy_link(&self, pasteboard: &NSPasteboard, url: &NSString) {
+        pasteboard.clearContents();
+        let copied = pasteboard.setString_forType(url, ns_string!("public.utf8-plain-text"));
+        self.message.setStringValue(if copied {
+            ns_string!("Link copied.")
+        } else {
+            ns_string!("Could not copy the link. Try again.")
+        });
+    }
+
+    pub fn browser_unavailable(&self) {
+        self.message.setStringValue(ns_string!(
+            "That browser is no longer available. Choose another browser."
+        ));
+    }
+
+    pub fn dispatch_failed(&self, browser: &str, mtm: MainThreadMarker) {
+        self.message.setStringValue(&NSString::from_str(&format!(
+            "Could not open {browser}. Choose another browser or try again."
+        )));
+        present(&self.window, mtm);
+    }
+
+    pub fn update(
+        &self,
+        content: Option<&ChooserContent>,
+        browser_count: usize,
+        show: bool,
+        mtm: MainThreadMarker,
+    ) {
+        let Some(content) = content else {
+            self.window.orderOut(None);
+            self.preview.setStringValue(ns_string!(""));
+            self.preview.setToolTip(None);
+            return;
+        };
+        self.preview.setStringValue(&content.preview);
+        self.preview.setToolTip(Some(&content.preview));
+        self.table.reloadData();
+        if browser_count > 0 {
+            self.table.selectRowIndexes_byExtendingSelection(
+                &NSIndexSet::indexSetWithIndex(content.selected_row),
+                false,
+            );
+        }
+        self.message
+            .setStringValue(&NSString::from_str(&if browser_count == 0 {
+                "No enabled browsers. Open Settings to enable or refresh browsers.".into()
+            } else if content.count > 1 {
+                format!("Open all {} links in the selected browser.", content.count)
+            } else {
+                "Use ↑ ↓ to choose, Return to open, or Escape to cancel.".into()
+            }));
+        self.set_busy(false, browser_count);
+        if show {
+            present(&self.window, mtm);
+            self.window.makeFirstResponder(Some(&self.table));
+        }
+    }
+
+    pub fn set_busy(&self, busy: bool, browser_count: usize) {
+        self.copy.setEnabled(!busy);
+        self.open.setEnabled(!busy && browser_count > 0);
+        self.cancel.setEnabled(!busy);
+        self.table.setEnabled(!busy);
+        if busy {
+            self.window.orderOut(None);
+            self.message
+                .setStringValue(ns_string!("Opening in your browser…"));
+        }
+    }
+}
+
+impl Settings {
+    pub fn set_status(&self, configuring: bool, status: &str) {
+        self.make_default.setEnabled(!configuring);
+        self.status.setStringValue(&NSString::from_str(status));
+    }
+}
+
+pub fn confirm_quit(mtm: MainThreadMarker) -> bool {
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(ns_string!("Quit with pending links?"));
+    alert.setInformativeText(ns_string!(
+        "Pending links are kept only in memory and will be discarded."
+    ));
+    alert.addButtonWithTitle(ns_string!("Keep ChooBro Open"));
+    alert.addButtonWithTitle(ns_string!("Quit"));
+    alert.runModal() == NSAlertSecondButtonReturn
 }
 
 pub fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {

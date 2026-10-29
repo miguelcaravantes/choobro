@@ -1,3 +1,5 @@
+#[path = "../src/app.rs"]
+mod app;
 #[path = "../src/browsers.rs"]
 mod browsers;
 #[path = "../src/requests.rs"]
@@ -5,8 +7,9 @@ mod requests;
 #[path = "../src/ui.rs"]
 mod ui;
 
-mod app {
-    include!("../src/app.rs");
+mod delegate {
+    include!("../src/ui/delegate.rs");
+    use objc2_foundation::{NSIndexSet, ns_string};
 
     pub fn smoke_test() {
         let will_launch = RcBlock::new(|_notification: std::ptr::NonNull<NSNotification>| {
@@ -58,7 +61,7 @@ mod app {
                     assert_eq!(chooser.cancel.keyEquivalent().to_string(), "\u{1b}");
                     assert!(state.settings.borrow().is_none());
                     delegate.cancel_request(sel!(cancelRequest:), None);
-                    assert!(state.requests.borrow().current().is_none());
+                    assert!(!state.app.has_pending());
                     assert!(!chooser.window.isVisible());
                     delegate.show_settings(sel!(showSettings:), None);
                     {
@@ -131,7 +134,7 @@ mod app {
                     assert!(chooser.table.frame().size.width > 0.0);
                     assert_eq!(
                         chooser.table.numberOfRows(),
-                        state.browsers.borrow().len() as isize
+                        state.app.browser_count() as isize
                     );
                     assert_eq!(
                         chooser.preview.stringValue().to_string(),
@@ -150,12 +153,12 @@ mod app {
                     let selected = chooser.table.selectedRow();
                     delegate.open_urls(sel!(application:openURLs:), &application, &urls);
                     assert_eq!(chooser.table.selectedRow(), selected);
-                    assert!(state.requests.borrow_mut().begin().is_some());
+                    assert!(state.app.begin_dispatch().is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.open.isEnabled());
                     assert!(!chooser.copy.isEnabled());
-                    assert!(state.requests.borrow().in_flight);
-                    assert!(state.requests.borrow().current().is_some());
+                    assert!(state.app.busy());
+                    assert!(state.app.has_pending());
                     assert!(
                         !chooser.window.isVisible(),
                         "dismiss the chooser before asking macOS to activate the browser"
@@ -177,17 +180,17 @@ mod app {
                             .to_string()
                             .contains("Could not open Test Browser")
                     );
-                    assert!(state.requests.borrow_mut().begin().is_some());
+                    assert!(state.app.begin_dispatch().is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.window.isVisible());
                     delegate.dispatch_finished(true, "Test Browser");
-                    assert!(state.requests.borrow().current().is_some());
+                    assert!(state.app.has_pending());
                     assert!(chooser.window.isVisible());
-                    assert!(state.requests.borrow_mut().begin().is_some());
+                    assert!(state.app.begin_dispatch().is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.window.isVisible());
                     delegate.dispatch_finished(true, "Test Browser");
-                    assert!(state.requests.borrow().current().is_none());
+                    assert!(!state.app.has_pending());
                     assert!(!chooser.window.isVisible());
                     assert!(chooser.preview.stringValue().is_empty());
                     let long_url = format!(
@@ -240,19 +243,8 @@ mod app {
                         long_url
                     );
                     assert_eq!(chooser.message.stringValue().to_string(), "Link copied.");
-                    assert!(!state.requests.borrow().in_flight);
-                    assert_eq!(
-                        state
-                            .requests
-                            .borrow()
-                            .current()
-                            .unwrap()
-                            .objectAtIndex(0)
-                            .absoluteString()
-                            .unwrap()
-                            .to_string(),
-                        long_url
-                    );
+                    assert!(!state.app.busy());
+                    assert_eq!(state.app.preview().unwrap().to_string(), long_url);
                     let open_frame = chooser
                         .open
                         .convertRect_toView(chooser.open.bounds(), Some(&content));
@@ -315,5 +307,5 @@ mod app {
 }
 
 fn main() {
-    app::smoke_test();
+    delegate::smoke_test();
 }

@@ -1,8 +1,9 @@
 use std::{collections::BTreeSet, path::Path};
 
+use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2_app_kit::{NSImage, NSWorkspace};
-use objc2_foundation::{NSArray, NSBundle, NSString, NSURL, NSUserDefaults, ns_string};
+use objc2_app_kit::{NSImage, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
+use objc2_foundation::{NSArray, NSBundle, NSError, NSString, NSURL, NSUserDefaults, ns_string};
 
 pub const BUNDLE_ID: &str = "io.github.miguelcaravantes.choobro";
 
@@ -137,6 +138,46 @@ pub fn default_status() -> String {
         })
         .collect();
     statuses.join(" · ")
+}
+
+pub fn available(browser: &Browser) -> bool {
+    Path::new(&browser.path).is_dir()
+        && NSBundle::bundleWithURL(&browser.url)
+            .and_then(|bundle| bundle.bundleIdentifier())
+            .is_some_and(|id| id.to_string() == browser.id)
+}
+
+pub fn is_app_bundle() -> bool {
+    NSBundle::mainBundle()
+        .bundleIdentifier()
+        .is_some_and(|id| id.to_string() == BUNDLE_ID)
+}
+
+pub fn open(browser: &Browser, urls: &NSArray<NSURL>, finished: impl Fn(bool) + Send + 'static) {
+    let completion = RcBlock::new(
+        move |_app: *mut NSRunningApplication, error: *mut NSError| {
+            finished(error.is_null());
+        },
+    );
+    let configuration = NSWorkspaceOpenConfiguration::new();
+    configuration.setActivates(true);
+    NSWorkspace::sharedWorkspace().openURLs_withApplicationAtURL_configuration_completionHandler(
+        urls,
+        &browser.url,
+        &configuration,
+        Some(&completion),
+    );
+}
+
+pub fn set_default_scheme(index: usize, finished: impl Fn(bool) + Send + 'static) {
+    let scheme = [ns_string!("http"), ns_string!("https")][index];
+    let completion = RcBlock::new(move |error: *mut NSError| finished(!error.is_null()));
+    NSWorkspace::sharedWorkspace()
+        .setDefaultApplicationAtURL_toOpenURLsWithScheme_completionHandler(
+            &NSBundle::mainBundle().bundleURL(),
+            scheme,
+            Some(&completion),
+        );
 }
 
 #[cfg(test)]
