@@ -5,9 +5,7 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::*;
-use objc2_foundation::{
-    MainThreadMarker, NSArray, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, ns_string,
-};
+use objc2_foundation::{MainThreadMarker, NSArray, NSObjectProtocol, NSSize, NSString, ns_string};
 
 use crate::{app::Delegate, browsers::Browser};
 
@@ -62,12 +60,30 @@ fn stack(mtm: MainThreadMarker, vertical: bool) -> Retained<NSStackView> {
     stack
 }
 
-pub fn button(title: &str, action: Sel, target: &Delegate) -> Retained<NSButton> {
+enum ButtonAction {
+    Settings,
+    Cancel,
+    Open,
+    MakeDefault,
+}
+
+impl ButtonAction {
+    fn selector(&self) -> Sel {
+        match self {
+            Self::Settings => sel!(showSettings:),
+            Self::Cancel => sel!(cancelRequest:),
+            Self::Open => sel!(openBrowser:),
+            Self::MakeDefault => sel!(makeDefault:),
+        }
+    }
+}
+
+fn button(title: &str, action: ButtonAction, target: &Delegate) -> Retained<NSButton> {
     unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str(title),
             Some(target),
-            Some(action),
+            Some(action.selector()),
             target.mtm(),
         )
     }
@@ -80,16 +96,11 @@ fn window(
     target: &Delegate,
 ) -> (Retained<NSWindow>, Retained<NSStackView>) {
     let mtm = target.mtm();
-    let window = unsafe {
-        NSWindow::initWithContentRect_styleMask_backing_defer(
-            NSWindow::alloc(mtm),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height)),
-            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
-            NSBackingStoreType::Buffered,
-            false,
-        )
-    };
-    unsafe { window.setReleasedWhenClosed(false) };
+    let controller = NSViewController::new(mtm);
+    controller.setView(&NSView::new(mtm));
+    let window = NSWindow::windowWithContentViewController(&controller);
+    window.setStyleMask(NSWindowStyleMask::Titled | NSWindowStyleMask::Closable);
+    window.setContentSize(NSSize::new(width, height));
     window.setTitle(&NSString::from_str(title));
     window.setDelegate(Some(ProtocolObject::from_ref(target)));
     window.center();
@@ -165,10 +176,10 @@ pub fn chooser(target: &Delegate) -> Chooser {
     root.addArrangedSubview(&message);
     fill_width(&message, &root);
     let actions = stack(mtm, false);
-    let settings = button("Settings…", sel!(showSettings:), target);
-    let cancel = button("Cancel", sel!(cancelRequest:), target);
+    let settings = button("Settings…", ButtonAction::Settings, target);
+    let cancel = button("Cancel", ButtonAction::Cancel, target);
     cancel.setKeyEquivalent(ns_string!("\u{1b}"));
-    let open = button("Open", sel!(openBrowser:), target);
+    let open = button("Open", ButtonAction::Open, target);
     open.setKeyEquivalent(ns_string!("\r"));
     actions.addArrangedSubview(&settings);
     let spacer = NSView::new(mtm);
@@ -278,8 +289,8 @@ pub fn settings(
     root.addArrangedSubview(&status);
     fill_width(&status, &root);
     let actions = stack(mtm, false);
-    let refresh = button("Refresh", sel!(showSettings:), target);
-    let make_default = button("Make Default Browser…", sel!(makeDefault:), target);
+    let refresh = button("Refresh", ButtonAction::Settings, target);
+    let make_default = button("Make Default Browser…", ButtonAction::MakeDefault, target);
     make_default.setEnabled(!configuring);
     actions.addArrangedSubview(&refresh);
     actions.addArrangedSubview(&make_default);

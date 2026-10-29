@@ -44,14 +44,25 @@ mod app {
                         "the accessory chooser must be a transient popup for window managers"
                     );
                     assert!(chooser.cancel.isEnabled());
+                    assert!(!chooser.window.isReleasedWhenClosed());
+                    assert!(chooser.window.contentViewController().is_some());
+                    assert_eq!(chooser.open.action(), Some(sel!(openBrowser:)));
+                    assert_eq!(chooser.open.keyEquivalent().to_string(), "\r");
+                    assert_eq!(chooser.cancel.action(), Some(sel!(cancelRequest:)));
+                    assert_eq!(chooser.cancel.keyEquivalent().to_string(), "\u{1b}");
                     assert!(state.settings.borrow().is_none());
                     delegate.cancel_request(sel!(cancelRequest:), None);
+                    assert!(state.requests.borrow().current().is_none());
+                    assert!(!chooser.window.isVisible());
                     delegate.show_settings(sel!(showSettings:), None);
                     {
                         let settings = state.settings.borrow();
                         let settings = settings.as_ref().unwrap();
                         assert!(settings.window.isVisible());
                         assert!(settings.window.accessibilityCloseButton().is_some());
+                        assert!(!settings.window.isReleasedWhenClosed());
+                        assert!(settings.window.contentViewController().is_some());
+                        assert_eq!(settings.make_default.action(), Some(sel!(makeDefault:)));
                         let content = settings.window.contentView().unwrap();
                         assert!(
                             content.wantsLayer(),
@@ -60,7 +71,12 @@ mod app {
                         content.layoutSubtreeIfNeeded();
                         assert!(content.frame().size.height > 0.0);
                         snapshot(&content, ns_string!("target/native-settings.png"));
+                        settings.window.close();
+                        assert!(!settings.window.isVisible());
+                        assert_eq!(settings.window.title().to_string(), "ChooBro Settings");
                     }
+                    delegate.show_settings(sel!(showSettings:), None);
+                    assert!(state.settings.borrow().as_ref().unwrap().window.isVisible());
                     let url = NSURL::URLWithString(ns_string!(
                         "https://example.invalid/a%2Fb?x=a%26b#test"
                     ))
