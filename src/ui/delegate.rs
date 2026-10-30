@@ -10,7 +10,7 @@ use objc2::{
 use objc2_app_kit::*;
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSObject, NSObjectProtocol,
-    NSOperationQueue, NSURL,
+    NSOperationQueue, NSString, NSURL, ns_string,
 };
 
 use crate::{
@@ -41,6 +41,11 @@ define_class!(
     unsafe impl NSObjectProtocol for Delegate {}
 
     unsafe impl NSApplicationDelegate for Delegate {
+        #[unsafe(method(applicationDidBecomeActive:))]
+        fn did_become_active(&self, _notification: &NSNotification) {
+            self.refresh_default_status();
+        }
+
         #[unsafe(method(applicationDidFinishLaunching:))]
         fn did_finish_launching(&self, _notification: &NSNotification) {
             let app = NSApplication::sharedApplication(self.mtm());
@@ -101,8 +106,31 @@ define_class!(
 
     unsafe impl NSTableViewDataSource for Delegate {
         #[unsafe(method(numberOfRowsInTableView:))]
-        fn number_of_rows(&self, _table: &NSTableView) -> NSInteger {
-            self.ivars().app.browser_count() as NSInteger
+        fn number_of_rows(&self, table: &NSTableView) -> NSInteger {
+            if is_settings_table(table) {
+                self.ivars().app.settings_browser_count() as NSInteger
+            } else {
+                self.ivars().app.browser_count() as NSInteger
+            }
+        }
+
+        #[unsafe(method_id(tableView:pasteboardWriterForRow:))]
+        fn browser_drag_writer(&self, table: &NSTableView, row: NSInteger) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+            self.browser_drag_item(table, row)
+        }
+
+        #[unsafe(method(tableView:validateDrop:proposedRow:proposedDropOperation:))]
+        fn validate_browser_drop(&self, table: &NSTableView, info: &ProtocolObject<dyn NSDraggingInfo>, row: NSInteger, _operation: NSTableViewDropOperation) -> NSDragOperation {
+            if self.browser_drop(table, info, row, NSTableViewDropOperation::Above).is_none() {
+                return NSDragOperation::None;
+            }
+            table.setDropRow_dropOperation(row, NSTableViewDropOperation::Above);
+            NSDragOperation::Move
+        }
+
+        #[unsafe(method(tableView:acceptDrop:row:dropOperation:))]
+        fn accept_browser_drop(&self, table: &NSTableView, info: &ProtocolObject<dyn NSDraggingInfo>, row: NSInteger, operation: NSTableViewDropOperation) -> bool {
+            self.perform_browser_drop(table, info, row, operation)
         }
     }
 
@@ -110,10 +138,30 @@ define_class!(
 
     unsafe impl NSTableViewDelegate for Delegate {
         #[unsafe(method_id(tableView:viewForTableColumn:row:))]
-        fn row_view(&self, _table: &NSTableView, _column: Option<&NSTableColumn>, row: NSInteger) -> Option<Retained<NSView>> {
+        fn row_view(&self, table: &NSTableView, column: Option<&NSTableColumn>, row: NSInteger) -> Option<Retained<NSView>> {
             usize::try_from(row).ok().and_then(|row| {
-                self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, self.mtm()))
+                if is_settings_table(table) {
+                    let browser = self.ivars().app.settings_browser(row)?;
+                    if column.is_some_and(|column| &*column.identifier() == ns_string!("enabled")) {
+                        let enabled = !browsers::exclusions().contains(&browser.id);
+                        Some(ui::browser_toggle(&browser, row, enabled, self))
+                    } else {
+                        Some(ui::browser_cell(&browser, self.mtm(), 0.0))
+                    }
+                } else {
+                    self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, self.mtm(), 8.0))
+                }
             })
+        }
+
+        #[unsafe(method(tableViewSelectionDidChange:))]
+        fn selection_changed(&self, notification: &NSNotification) {
+            if notification.object().and_then(|object| object.downcast::<NSTableView>().ok())
+                .is_some_and(|table| is_settings_table(&table))
+                && let Some(settings) = &*self.ivars().settings.borrow()
+            {
+                settings.update_move_buttons();
+            }
         }
     }
 
@@ -125,15 +173,8 @@ define_class!(
 
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
-            let (browsers, excluded) = self.ivars().app.refresh_settings();
-            let settings = ui::settings(self, &browsers, &excluded, self.ivars().app.configuring(), browsers::manual_order());
-            let old = self.ivars().settings.borrow_mut().replace(settings);
-            if let Some(old) = old {
-                if let Some(settings) = &*self.ivars().settings.borrow() {
-                    settings.window.setFrame_display(old.window.frame(), false);
-                }
-                old.window.orderOut(None);
-            }
+            let selected = self.settings_selection();
+            self.refresh_settings(selected);
             if let Some(settings) = &*self.ivars().settings.borrow() {
                 ui::present(&settings.window, self.mtm());
             }
@@ -152,25 +193,28 @@ define_class!(
         fn toggle_browser(&self, sender: &NSButton) {
             if let Ok(index) = usize::try_from(sender.tag()) {
                 self.ivars().app.set_browser_enabled(index, sender.state() == NSControlStateValueOn);
+                if let Some(settings) = &*self.ivars().settings.borrow() {
+                    settings.update(index, browsers::manual_order());
+                }
             }
             self.refresh_chooser(false);
         }
 
         #[unsafe(method(changeBrowserSort:))]
-        fn change_browser_sort(&self, sender: &NSButton) {
-            browsers::set_manual_order(sender.state() == NSControlStateValueOn);
-            self.show_settings(sel!(showSettings:), None);
+        fn change_browser_sort(&self, sender: &NSPopUpButton) {
+            browsers::set_manual_order(sender.indexOfSelectedItem() == 1);
+            self.refresh_settings(self.settings_selection());
             self.refresh_chooser(false);
         }
 
         #[unsafe(method(moveBrowserUp:))]
-        fn move_browser_up(&self, sender: &NSButton) {
-            self.move_settings_browser(sender, -1);
+        fn move_browser_up(&self, _sender: &NSButton) {
+            self.move_settings_browser(-1);
         }
 
         #[unsafe(method(moveBrowserDown:))]
-        fn move_browser_down(&self, sender: &NSButton) {
-            self.move_settings_browser(sender, 1);
+        fn move_browser_down(&self, _sender: &NSButton) {
+            self.move_settings_browser(1);
         }
 
         #[unsafe(method(cancelRequest:))]
@@ -224,15 +268,102 @@ define_class!(
 );
 
 impl Delegate {
-    fn move_settings_browser(&self, sender: &NSButton, offset: isize) {
-        if let Ok(index) = usize::try_from(sender.tag())
+    fn browser_drag_item(
+        &self,
+        table: &NSTableView,
+        row: NSInteger,
+    ) -> Option<Retained<ProtocolObject<dyn NSPasteboardWriting>>> {
+        if !is_settings_table(table) || !browsers::manual_order() {
+            return None;
+        }
+        let browser = self
+            .ivars()
+            .app
+            .settings_browser(usize::try_from(row).ok()?)?;
+        let item = NSPasteboardItem::new();
+        if !item.setString_forType(&NSString::from_str(&browser.path), ui::browser_drag_type()) {
+            return None;
+        }
+        Some(ProtocolObject::from_retained(item))
+    }
+
+    fn perform_browser_drop(
+        &self,
+        table: &NSTableView,
+        info: &ProtocolObject<dyn NSDraggingInfo>,
+        row: NSInteger,
+        operation: NSTableViewDropOperation,
+    ) -> bool {
+        let Some((path, insertion)) = self.browser_drop(table, info, row, operation) else {
+            return false;
+        };
+        let Some(destination) = self.ivars().app.drop_browser(&path, insertion) else {
+            return false;
+        };
+        self.refresh_settings(Some(destination));
+        self.refresh_chooser(false);
+        true
+    }
+
+    fn browser_drop(
+        &self,
+        table: &NSTableView,
+        info: &ProtocolObject<dyn NSDraggingInfo>,
+        row: NSInteger,
+        operation: NSTableViewDropOperation,
+    ) -> Option<(String, usize)> {
+        if !is_settings_table(table) || operation != NSTableViewDropOperation::Above {
+            return None;
+        }
+        let source = info.draggingSource()?.downcast::<NSTableView>().ok()?;
+        if !std::ptr::eq(&*source, table) {
+            return None;
+        }
+        let insertion = usize::try_from(row).ok()?;
+        let path = info
+            .draggingPasteboard()
+            .stringForType(ui::browser_drag_type())?
+            .to_string();
+        self.ivars()
+            .app
+            .browser_drop_destination(&path, insertion)?;
+        Some((path, insertion))
+    }
+
+    fn settings_selection(&self) -> Option<usize> {
+        self.ivars()
+            .settings
+            .borrow()
+            .as_ref()
+            .and_then(|settings| usize::try_from(settings.table.selectedRow()).ok())
+    }
+
+    fn refresh_settings(&self, selected: Option<usize>) {
+        let selected_row = self.ivars().app.refresh_settings(selected);
+        if self.ivars().settings.borrow().is_none() {
+            let settings = ui::settings(self, self.ivars().app.configuring());
+            self.ivars().settings.borrow_mut().replace(settings);
+        }
+        if let Some(settings) = &*self.ivars().settings.borrow() {
+            settings.update(selected_row, browsers::manual_order());
+        }
+        self.refresh_default_status();
+    }
+
+    fn refresh_default_status(&self) {
+        if !self.ivars().app.configuring()
+            && let Some(settings) = &*self.ivars().settings.borrow()
+        {
+            settings.set_status(false, &browsers::default_status());
+        }
+    }
+
+    fn move_settings_browser(&self, offset: isize) {
+        if let Some(index) = self.settings_selection()
             && self.ivars().app.move_browser(index, offset)
         {
-            self.show_settings(sel!(showSettings:), None);
+            self.refresh_settings(index.checked_add_signed(offset));
             self.refresh_chooser(false);
-            if let Some(settings) = &*self.ivars().settings.borrow() {
-                settings.focus_browser_move(index.checked_add_signed(offset).unwrap(), offset);
-            }
         }
     }
 
@@ -300,6 +431,10 @@ impl Delegate {
             });
         });
     }
+}
+
+fn is_settings_table(table: &NSTableView) -> bool {
+    table.identifier().as_deref() == Some(ns_string!("settingsBrowsers"))
 }
 
 fn with_delegate(f: impl FnOnce(&Delegate)) {

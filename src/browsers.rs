@@ -78,11 +78,23 @@ pub fn move_browser(browsers: &mut [Browser], index: usize, offset: isize) -> bo
     let Some(destination) = index.checked_add_signed(offset) else {
         return false;
     };
-    if index >= browsers.len() || destination >= browsers.len() {
+    if index >= browsers.len() || destination >= browsers.len() || index == destination {
         return false;
     }
-    browsers.swap(index, destination);
+    if index < destination {
+        browsers[index..=destination].rotate_left(1);
+    } else {
+        browsers[destination..=index].rotate_right(1);
+    }
     true
+}
+
+pub fn drop_destination(source: usize, insertion: usize, count: usize) -> Option<usize> {
+    if source >= count || insertion > count {
+        return None;
+    }
+    let destination = insertion - usize::from(source < insertion);
+    (destination != source).then_some(destination)
 }
 
 fn eligible(id: &str, path: &str, own_path: &str) -> bool {
@@ -167,19 +179,25 @@ pub fn discover(schemes: &BTreeSet<String>) -> Vec<Browser> {
     browsers
 }
 
+fn is_default_for_scheme(scheme: &str) -> bool {
+    let probe = NSURL::URLWithString(&NSString::from_str(&format!("{scheme}://example.invalid")))
+        .expect("fixed probe URL");
+    NSWorkspace::sharedWorkspace()
+        .URLForApplicationToOpenURL(&probe)
+        .and_then(|url| NSBundle::bundleWithURL(&url))
+        .and_then(|bundle| bundle.bundleIdentifier())
+        .is_some_and(|id| id.to_string() == BUNDLE_ID)
+}
+
+pub fn is_default_browser() -> bool {
+    ["http", "https"].into_iter().all(is_default_for_scheme)
+}
+
 pub fn default_status() -> String {
-    let workspace = NSWorkspace::sharedWorkspace();
     let statuses: Vec<_> = ["http", "https"]
         .into_iter()
         .map(|scheme| {
-            let probe =
-                NSURL::URLWithString(&NSString::from_str(&format!("{scheme}://example.invalid")))
-                    .expect("fixed probe URL");
-            let is_default = workspace
-                .URLForApplicationToOpenURL(&probe)
-                .and_then(|url| NSBundle::bundleWithURL(&url))
-                .and_then(|bundle| bundle.bundleIdentifier())
-                .is_some_and(|id| id.to_string() == BUNDLE_ID);
+            let is_default = is_default_for_scheme(scheme);
             format!(
                 "{}: {}",
                 scheme.to_uppercase(),
@@ -294,11 +312,53 @@ mod tests {
         assert!(!move_browser(&mut browsers, 1, 1));
         assert!(!move_browser(&mut browsers, usize::MAX, 1));
         assert!(!move_browser(&mut browsers, 2, -1));
+        assert!(!move_browser(&mut browsers, 0, 0));
         assert!(move_browser(&mut browsers, 0, 1));
         assert_eq!(browsers[0].name, "Safari");
         assert!(move_browser(&mut browsers, 1, -1));
         assert_eq!(browsers[0].name, "Chrome");
         assert!(!move_browser(&mut [], 0, 1));
+    }
+
+    #[test]
+    fn dragging_preserves_the_relative_order_of_other_browsers() {
+        let mut browsers = vec![
+            browser("Chrome", "/Chrome.app"),
+            browser("Firefox", "/Firefox.app"),
+            browser("Safari", "/Safari.app"),
+            browser("Brave", "/Brave.app"),
+        ];
+        assert!(move_browser(&mut browsers, 0, 3));
+        assert_eq!(
+            browsers
+                .iter()
+                .map(|browser| browser.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Firefox", "Safari", "Brave", "Chrome"]
+        );
+        assert!(move_browser(&mut browsers, 3, -3));
+        assert_eq!(
+            browsers
+                .iter()
+                .map(|browser| browser.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Chrome", "Firefox", "Safari", "Brave"]
+        );
+    }
+
+    #[test]
+    fn drop_positions_account_for_removing_the_dragged_row() {
+        assert_eq!(drop_destination(0, 4, 4), Some(3));
+        assert_eq!(drop_destination(0, 2, 4), Some(1));
+        assert_eq!(drop_destination(3, 0, 4), Some(0));
+        assert_eq!(drop_destination(3, 2, 4), Some(2));
+        assert_eq!(drop_destination(1, 1, 4), None);
+        assert_eq!(drop_destination(1, 2, 4), None);
+        assert_eq!(drop_destination(0, 0, 0), None);
+        assert_eq!(drop_destination(0, 1, 1), None);
+        assert_eq!(drop_destination(4, 0, 4), None);
+        assert_eq!(drop_destination(0, 5, 4), None);
+        assert_eq!(drop_destination(usize::MAX, usize::MAX, 4), None);
     }
 
     #[test]

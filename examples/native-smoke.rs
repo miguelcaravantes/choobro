@@ -9,7 +9,7 @@ mod ui;
 
 mod delegate {
     include!("../src/ui/delegate.rs");
-    use objc2_foundation::{NSIndexSet, ns_string};
+    use objc2_foundation::NSIndexSet;
 
     pub fn smoke_test() {
         let will_launch = RcBlock::new(|_notification: std::ptr::NonNull<NSNotification>| {
@@ -72,6 +72,29 @@ mod delegate {
                         assert!(!settings.window.isReleasedWhenClosed());
                         assert!(settings.window.contentViewController().is_some());
                         assert_eq!(settings.make_default.action(), Some(sel!(makeDefault:)));
+                        assert_eq!(
+                            settings.default_warning.isHidden(),
+                            browsers::is_default_browser()
+                        );
+                        assert_eq!(
+                            settings.default_warning.textColor().as_deref(),
+                            Some(&*NSColor::systemRedColor())
+                        );
+                        assert!(
+                            settings
+                                .default_warning
+                                .stringValue()
+                                .to_string()
+                                .contains("must be your default browser")
+                        );
+                        settings.set_status(true, "Waiting for macOS approval…");
+                        assert!(!settings.make_default.isEnabled());
+                        assert_eq!(
+                            settings.default_warning.isHidden(),
+                            browsers::is_default_browser()
+                        );
+                        settings.set_status(false, &browsers::default_status());
+                        assert!(settings.make_default.isEnabled());
                         let content = settings.window.contentView().unwrap();
                         assert!(
                             content.wantsLayer(),
@@ -79,102 +102,252 @@ mod delegate {
                         );
                         content.layoutSubtreeIfNeeded();
                         assert!(content.frame().size.height > 0.0);
+                        assert_eq!(
+                            settings.table.numberOfRows(),
+                            state.app.settings_browser_count() as isize
+                        );
+                        assert_eq!(settings.table.tableColumns().len(), 2);
+                        assert!(
+                            settings
+                                .table
+                                .registeredDraggedTypes()
+                                .iter()
+                                .any(|drag_type| &*drag_type == ui::browser_drag_type())
+                        );
+                        assert!(
+                            delegate
+                                .tableView_pasteboardWriterForRow(&chooser.table, 0)
+                                .is_none()
+                        );
+                        assert!(
+                            delegate
+                                .tableView_pasteboardWriterForRow(&settings.table, -1)
+                                .is_none()
+                        );
+                        assert!(
+                            delegate
+                                .tableView_pasteboardWriterForRow(
+                                    &settings.table,
+                                    settings.table.numberOfRows()
+                                )
+                                .is_none()
+                        );
+                        let writer = delegate.tableView_pasteboardWriterForRow(&settings.table, 0);
+                        assert_eq!(
+                            writer.is_some(),
+                            browsers::manual_order() && settings.table.numberOfRows() > 0
+                        );
+                        if let Some(writer) = writer {
+                            let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+                            assert!(
+                                pasteboard.writeObjects(&NSArray::from_retained_slice(&[writer]))
+                            );
+                            assert_eq!(
+                                pasteboard
+                                    .stringForType(ui::browser_drag_type())
+                                    .unwrap()
+                                    .to_string(),
+                                state.app.settings_browser(0).unwrap().path
+                            );
+                            pasteboard.clearContents();
+                        }
+                        if let Some(browser) = state.app.settings_browser(0) {
+                            let count = state.app.settings_browser_count();
+                            let expected =
+                                (browsers::manual_order() && count > 1).then_some((0, count - 1));
+                            assert_eq!(
+                                state.app.browser_drop_destination(&browser.path, count),
+                                expected
+                            );
+                            assert!(
+                                state
+                                    .app
+                                    .browser_drop_destination(&browser.path, 0)
+                                    .is_none()
+                            );
+                            assert!(
+                                state
+                                    .app
+                                    .browser_drop_destination(&browser.path, count + 1)
+                                    .is_none()
+                            );
+                            assert!(
+                                state
+                                    .app
+                                    .browser_drop_destination("/Missing.app", count)
+                                    .is_none()
+                            );
+                            assert_eq!(state.app.settings_browser(0).unwrap().path, browser.path);
+                        }
+                        assert_eq!(settings.sort.action(), Some(sel!(changeBrowserSort:)));
+                        assert_eq!(settings.move_up.action(), Some(sel!(moveBrowserUp:)));
+                        assert_eq!(settings.move_down.action(), Some(sel!(moveBrowserDown:)));
+                        assert!(settings.move_up.image().is_some());
+                        assert!(settings.move_down.image().is_some());
+                        assert_eq!(
+                            settings.move_up.imagePosition(),
+                            NSCellImagePosition::ImageOnly
+                        );
+                        assert!(settings.table.frame().size.height >= 320.0);
+                        if settings.table.numberOfRows() >= 7 {
+                            let seventh_row = settings.table.rectOfRow(6);
+                            let visible = settings.table.visibleRect();
+                            assert!(
+                                seventh_row.origin.y + seventh_row.size.height
+                                    <= visible.origin.y + visible.size.height
+                            );
+                        }
+                        let table_frame = settings
+                            .table
+                            .enclosingScrollView()
+                            .unwrap()
+                            .convertRect_toView(
+                                settings.table.enclosingScrollView().unwrap().bounds(),
+                                Some(&content),
+                            );
+                        let up_frame = settings
+                            .move_up
+                            .convertRect_toView(settings.move_up.bounds(), Some(&content));
                         let root = content
                             .subviews()
                             .objectAtIndex(0)
                             .downcast::<NSStackView>()
                             .unwrap();
-                        let scroll = root
+                        let default_section = root
                             .arrangedSubviews()
-                            .iter()
-                            .find_map(|view| view.downcast::<NSScrollView>().ok())
-                            .unwrap();
-                        let list = scroll
-                            .documentView()
+                            .lastObject()
                             .unwrap()
                             .downcast::<NSStackView>()
                             .unwrap();
-                        for view in list.arrangedSubviews() {
-                            let rect = view.alignmentRectForFrame(view.frame());
-                            assert!(rect.origin.x >= 11.9);
-                            assert!(rect.origin.y >= 11.9);
-                            assert!(
-                                rect.origin.x + rect.size.width <= list.bounds().size.width - 11.9
+                        assert!(
+                            default_section
+                                .arrangedSubviews()
+                                .iter()
+                                .any(|view| &*view == settings.status.as_ref())
+                        );
+                        let default_header = default_section
+                            .arrangedSubviews()
+                            .objectAtIndex(0)
+                            .downcast::<NSStackView>()
+                            .unwrap();
+                        assert!(
+                            default_header
+                                .arrangedSubviews()
+                                .iter()
+                                .any(|view| &*view == settings.make_default.as_ref())
+                        );
+                        let heading = default_header
+                            .arrangedSubviews()
+                            .objectAtIndex(0)
+                            .downcast::<NSTextField>()
+                            .unwrap();
+                        assert_eq!(heading.stringValue().to_string(), "Default browser");
+                        let default_frame = default_section
+                            .convertRect_toView(default_section.bounds(), Some(&content));
+                        assert!(
+                            default_frame.origin.y + default_frame.size.height
+                                < table_frame.origin.y
+                        );
+                        assert!(root.arrangedSubviews().iter().any(|view| {
+                            view.downcast::<NSBox>()
+                                .is_ok_and(|divider| divider.boxType() == NSBoxType::Separator)
+                        }));
+                        assert!(up_frame.origin.x >= table_frame.origin.x + table_frame.size.width);
+                        assert!(
+                            up_frame.origin.x + up_frame.size.width
+                                <= content.bounds().size.width - 23.9
+                        );
+                        if let Some(browser) = state.app.settings_browser(0) {
+                            for enabled in [false, true] {
+                                let view = ui::browser_toggle(&browser, 0, enabled, delegate);
+                                let toggle = view
+                                    .subviews()
+                                    .objectAtIndex(0)
+                                    .downcast::<NSButton>()
+                                    .unwrap();
+                                assert_eq!(toggle.action(), Some(sel!(toggleBrowser:)));
+                                assert_eq!(toggle.state() == NSControlStateValueOn, enabled);
+                                assert_eq!(toggle.tag(), 0);
+                                assert!(
+                                    NSAccessibility::accessibilityLabel(&*toggle)
+                                        .unwrap()
+                                        .to_string()
+                                        .contains(&browser.name)
+                                );
+                            }
+                            let cell = ui::browser_cell(&browser, delegate.mtm(), 0.0)
+                                .downcast::<NSTableCellView>()
+                                .unwrap();
+                            assert_eq!(
+                                unsafe { cell.textField() }
+                                    .unwrap()
+                                    .stringValue()
+                                    .to_string(),
+                                browser.name
                             );
-                            assert!(
-                                rect.origin.y + rect.size.height
-                                    <= list.bounds().size.height - 11.9
-                            );
+                            assert!(unsafe { cell.imageView() }.unwrap().image().is_some());
                         }
+                        for manual in [false, true] {
+                            settings.update(0, manual);
+                            assert_eq!(settings.sort.indexOfSelectedItem(), isize::from(manual));
+                            let count = settings.table.numberOfRows();
+                            for row in 0..count {
+                                settings.table.selectRowIndexes_byExtendingSelection(
+                                    &NSIndexSet::indexSetWithIndex(row as usize),
+                                    false,
+                                );
+                                assert_eq!(settings.move_up.isEnabled(), manual && row > 0);
+                                assert_eq!(
+                                    settings.move_down.isEnabled(),
+                                    manual && row + 1 < count
+                                );
+                            }
+                            if manual {
+                                settings.update(0, manual);
+                                snapshot(&content, ns_string!("target/native-manual-settings.png"));
+                            }
+                        }
+                        settings.update(0, browsers::manual_order());
+                        unsafe { settings.table.setDataSource(None) };
+                        settings.update(0, true);
+                        assert_eq!(settings.table.numberOfRows(), 0);
+                        assert!(!settings.move_up.isEnabled());
+                        assert!(!settings.move_down.isEnabled());
+                        unsafe {
+                            settings
+                                .table
+                                .setDataSource(Some(ProtocolObject::from_ref(delegate)))
+                        };
+                        settings.update(0, browsers::manual_order());
                         snapshot(&content, ns_string!("target/native-settings.png"));
+                        settings.default_warning.setHidden(false);
+                        content.layoutSubtreeIfNeeded();
+                        assert!(settings.table.frame().size.height >= 320.0);
+                        snapshot(&content, ns_string!("target/native-default-warning.png"));
+                        settings.set_status(false, &browsers::default_status());
                         settings.window.close();
                         assert!(!settings.window.isVisible());
                         assert_eq!(settings.window.title().to_string(), "ChooBro Settings");
                     }
                     delegate.show_settings(sel!(showSettings:), None);
                     assert!(state.settings.borrow().as_ref().unwrap().window.isVisible());
-                    let browsers: Vec<_> = ["Chrome", "Firefox", "Safari"]
-                        .into_iter()
-                        .map(|name| browsers::Browser {
-                            id: name.into(),
-                            name: name.into(),
-                            path: format!("/Applications/{name}.app"),
-                            url: NSURL::fileURLWithPath(ns_string!("/Applications")),
-                            icon: NSImage::new(),
-                        })
-                        .collect();
-                    for manual in [false, true] {
-                        let settings =
-                            ui::settings(delegate, &browsers, &Default::default(), false, manual);
-                        let content = settings.window.contentView().unwrap();
-                        content.layoutSubtreeIfNeeded();
-                        let root = content
-                            .subviews()
-                            .objectAtIndex(0)
-                            .downcast::<NSStackView>()
-                            .unwrap();
-                        let sort = root
-                            .arrangedSubviews()
-                            .iter()
-                            .find_map(|view| view.downcast::<NSButton>().ok())
-                            .unwrap();
-                        assert_eq!(sort.action(), Some(sel!(changeBrowserSort:)));
-                        assert_eq!(sort.state() == NSControlStateValueOn, manual);
-                        let scroll = root
-                            .arrangedSubviews()
-                            .iter()
-                            .find_map(|view| view.downcast::<NSScrollView>().ok())
-                            .unwrap();
-                        let list = scroll
-                            .documentView()
-                            .unwrap()
-                            .downcast::<NSStackView>()
-                            .unwrap();
-                        for (index, row) in list.arrangedSubviews().iter().enumerate() {
-                            let row = row.downcast::<NSStackView>().unwrap();
-                            let buttons: Vec<_> = row
-                                .arrangedSubviews()
-                                .iter()
-                                .filter_map(|view| view.downcast::<NSButton>().ok())
-                                .collect();
-                            assert_eq!(buttons.len(), 3);
-                            assert_eq!(buttons[0].action(), Some(sel!(toggleBrowser:)));
-                            assert_eq!(buttons[1].action(), Some(sel!(moveBrowserUp:)));
-                            assert_eq!(buttons[2].action(), Some(sel!(moveBrowserDown:)));
-                            assert_eq!(buttons[1].tag(), index as isize);
-                            assert_eq!(buttons[2].tag(), index as isize);
-                            assert_eq!(buttons[1].isEnabled(), manual && index > 0);
-                            assert_eq!(
-                                buttons[2].isEnabled(),
-                                manual && index + 1 < browsers.len()
-                            );
-                            assert!(row.frame().size.width <= list.bounds().size.width - 23.9);
-                        }
-                        if manual {
-                            settings.focus_browser_move(1, 1);
-                            snapshot(&content, ns_string!("target/native-manual-settings.png"));
-                        }
-                        settings.window.close();
+                    if state.app.settings_browser_count() > 1 {
+                        let table = state.settings.borrow().as_ref().unwrap().table.clone();
+                        table.selectRowIndexes_byExtendingSelection(
+                            &NSIndexSet::indexSetWithIndex(1),
+                            false,
+                        );
+                        let selected_path = state.app.settings_browser(1).unwrap().path;
+                        delegate.show_settings(sel!(showSettings:), None);
+                        assert_eq!(&*state.settings.borrow().as_ref().unwrap().table, &*table);
+                        assert_eq!(
+                            state
+                                .app
+                                .settings_browser(table.selectedRow() as usize)
+                                .unwrap()
+                                .path,
+                            selected_path
+                        );
                     }
                     let url = NSURL::URLWithString(ns_string!(
                         "https://example.invalid/a%2Fb?x=a%26b#test"
@@ -354,6 +527,7 @@ mod delegate {
     }
 
     fn snapshot(view: &NSView, path: &objc2_foundation::NSString) {
+        view.window().unwrap().displayIfNeeded();
         let bitmap = view
             .bitmapImageRepForCachingDisplayInRect(view.bounds())
             .unwrap();

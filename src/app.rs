@@ -116,10 +116,25 @@ impl App {
         })
     }
 
-    pub fn refresh_settings(&self) -> (Vec<Browser>, BTreeSet<String>) {
+    pub fn settings_browser_count(&self) -> usize {
+        self.settings_browsers.borrow().len()
+    }
+
+    pub fn settings_browser(&self, index: usize) -> Option<Browser> {
+        self.settings_browsers.borrow().get(index).cloned()
+    }
+
+    pub fn refresh_settings(&self, selected: Option<usize>) -> usize {
+        let selected_path = selected
+            .and_then(|index| self.settings_browser(index))
+            .map(|browser| browser.path);
         let browsers = browsers::discover(&BTreeSet::from(["http".into(), "https".into()]));
-        *self.settings_browsers.borrow_mut() = browsers.clone();
-        (browsers, browsers::exclusions())
+        let selected_row = browsers
+            .iter()
+            .position(|browser| Some(&browser.path) == selected_path.as_ref())
+            .unwrap_or(0);
+        *self.settings_browsers.borrow_mut() = browsers;
+        selected_row
     }
 
     pub fn set_browser_enabled(&self, index: usize, enabled: bool) {
@@ -138,6 +153,22 @@ impl App {
         }
         browsers::set_browser_order(&browsers);
         true
+    }
+
+    pub fn browser_drop_destination(&self, path: &str, insertion: usize) -> Option<(usize, usize)> {
+        if !browsers::manual_order() {
+            return None;
+        }
+        let browsers = self.settings_browsers.borrow();
+        let source = browsers.iter().position(|browser| browser.path == path)?;
+        let destination = browsers::drop_destination(source, insertion, browsers.len())?;
+        Some((source, destination))
+    }
+
+    pub fn drop_browser(&self, path: &str, insertion: usize) -> Option<usize> {
+        let (source, destination) = self.browser_drop_destination(path, insertion)?;
+        self.move_browser(source, destination as isize - source as isize)
+            .then_some(destination)
     }
 
     pub fn cancel(&self) {
