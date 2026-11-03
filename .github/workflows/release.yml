@@ -19,8 +19,9 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
+  group: choobro-release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
@@ -39,6 +40,7 @@ jobs:
       - name: Check code
         run: |
           test "$(uname -m)" = arm64
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           cargo fmt --check
           cargo clippy --locked --all-targets -- -D warnings
           cargo test --locked
@@ -81,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
           version="${RELEASE_TAG#v}"
           published="$RUNNER_TEMP/published-dmg"
           mkdir -p "$published"

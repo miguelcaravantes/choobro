@@ -1,6 +1,6 @@
 [package]
 name = "choobro"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT"
@@ -25,7 +25,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std", "block2", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSError", "NSGeometry",
-    "NSIndexSet", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSString", "NSURL",
+    "NSIndexSet", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSRange", "NSString", "NSURL",
     "NSUserDefaults", "NSValue",
 ] }
 

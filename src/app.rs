@@ -1,16 +1,13 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    cell::{Cell, RefCell},
-    collections::BTreeSet,
-};
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSString, NSURL, ns_string};
 
 use crate::{
     browsers::{self, Browser},
-    requests::Requests,
+    requests::{Rejection, Requests},
 };
 
 #[derive(Default)]
@@ -26,7 +23,7 @@ pub struct App {
 pub enum Incoming {
     Show,
     Queued,
-    Rejected,
+    Rejected(Rejection),
 }
 
 pub enum OpenRequest {
@@ -45,12 +42,10 @@ impl App {
     pub fn receive(&self, urls: &NSArray<NSURL>) -> Incoming {
         let mut requests = self.requests.borrow_mut();
         let pending = requests.current().is_some();
-        if !requests.push(urls) {
-            Incoming::Rejected
-        } else if pending {
-            Incoming::Queued
-        } else {
-            Incoming::Show
+        match requests.push(urls) {
+            Err(reason) => Incoming::Rejected(reason),
+            Ok(()) if pending => Incoming::Queued,
+            Ok(()) => Incoming::Show,
         }
     }
 
@@ -128,7 +123,7 @@ impl App {
         let selected_path = selected
             .and_then(|index| self.settings_browser(index))
             .map(|browser| browser.path);
-        let browsers = browsers::discover(&BTreeSet::from(["http".into(), "https".into()]));
+        let browsers = browsers::discover_all();
         let selected_row = browsers
             .iter()
             .position(|browser| Some(&browser.path) == selected_path.as_ref())
@@ -241,7 +236,10 @@ mod tests {
             app.receive(&urls("https://second.example")),
             Incoming::Queued
         );
-        assert_eq!(app.receive(&urls("file:///private")), Incoming::Rejected);
+        assert_eq!(
+            app.receive(&urls("file:///private")),
+            Incoming::Rejected(Rejection::Unsupported)
+        );
         assert_eq!(app.preview().unwrap().to_string(), "https://first.example");
         app.cancel();
         assert_eq!(app.preview().unwrap().to_string(), "https://second.example");
@@ -267,6 +265,21 @@ mod tests {
         assert!(!app.dispatch_finished(true));
         assert!(!app.has_pending());
         assert!(!app.busy());
+    }
+
+    #[test]
+    fn a_full_queue_reports_the_limit_without_replacing_pending_links() {
+        let app = App::default();
+        let url = urls("https://first.example").objectAtIndex(0);
+        let batch = NSArray::from_retained_slice(&vec![url; 256]);
+        assert_eq!(app.receive(&batch), Incoming::Show);
+        assert_eq!(
+            app.receive(&urls("https://second.example")),
+            Incoming::Rejected(Rejection::Full)
+        );
+        assert_eq!(app.preview().unwrap().to_string(), "https://first.example");
+        app.cancel();
+        assert_eq!(app.receive(&urls("https://second.example")), Incoming::Show);
     }
 
     #[test]

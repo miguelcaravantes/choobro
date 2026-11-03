@@ -5,7 +5,9 @@ use objc2::{
     sel,
 };
 use objc2_app_kit::*;
-use objc2_foundation::{MainThreadMarker, NSArray, NSIndexSet, NSSize, NSString, ns_string};
+use objc2_foundation::{
+    MainThreadMarker, NSArray, NSIndexSet, NSRange, NSSize, NSString, ns_string,
+};
 
 use crate::{app::ChooserContent, browsers::Browser, delegate::Delegate};
 
@@ -74,12 +76,13 @@ impl Chooser {
         };
         self.preview.setStringValue(&content.preview);
         self.preview.setToolTip(Some(&content.preview));
-        self.table.reloadData();
+        reload_table(&self.table);
         if browser_count > 0 {
             self.table.selectRowIndexes_byExtendingSelection(
                 &NSIndexSet::indexSetWithIndex(content.selected_row),
                 false,
             );
+            self.table.scrollRowToVisible(content.selected_row as isize);
         }
         self.message
             .setStringValue(&NSString::from_str(&if browser_count == 0 {
@@ -112,7 +115,7 @@ impl Chooser {
 impl Settings {
     pub fn update(&self, selected_row: usize, manual: bool) {
         self.sort.selectItemAtIndex(isize::from(manual));
-        self.table.reloadData();
+        reload_table(&self.table);
         if self.table.numberOfRows() > 0 {
             self.table.selectRowIndexes_byExtendingSelection(
                 &NSIndexSet::indexSetWithIndex(selected_row),
@@ -161,6 +164,14 @@ pub fn confirm_quit(mtm: MainThreadMarker) -> bool {
 
 pub fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
     NSTextField::labelWithString(&NSString::from_str(text), mtm)
+}
+
+fn reload_table(table: &NSTableView) {
+    table.noteNumberOfRowsChanged();
+    table.reloadDataForRowIndexes_columnIndexes(
+        &NSIndexSet::indexSetWithIndexesInRange(NSRange::new(0, table.numberOfRows() as usize)),
+        &NSIndexSet::indexSetWithIndexesInRange(NSRange::new(0, table.numberOfColumns() as usize)),
+    );
 }
 
 fn stack(mtm: MainThreadMarker, vertical: bool) -> Retained<NSStackView> {
@@ -309,7 +320,9 @@ pub fn chooser(target: &Delegate) -> Chooser {
         .constraintGreaterThanOrEqualToConstant(100.0)
         .setActive(true);
 
-    let message = label("", mtm);
+    let message = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+    message.setSelectable(false);
+    message.setPreferredMaxLayoutWidth(432.0);
     message.setMaximumNumberOfLines(2);
     message.setTextColor(Some(&NSColor::secondaryLabelColor()));
     root.addArrangedSubview(&message);
@@ -339,34 +352,46 @@ pub fn chooser(target: &Delegate) -> Chooser {
     }
 }
 
-pub fn browser_cell(browser: &Browser, mtm: MainThreadMarker, icon_inset: f64) -> Retained<NSView> {
-    let cell = NSTableCellView::new(mtm);
-    let icon = NSImageView::new(mtm);
-    icon.setImage(Some(&browser.icon));
-    icon.setTranslatesAutoresizingMaskIntoConstraints(false);
-    let text = label(&browser.name, mtm);
-    text.setTranslatesAutoresizingMaskIntoConstraints(false);
-    cell.addSubview(&icon);
-    cell.addSubview(&text);
-    unsafe {
-        cell.setTextField(Some(&text));
-        cell.setImageView(Some(&icon));
-    }
+pub fn browser_cell(browser: &Browser, table: &NSTableView, icon_inset: f64) -> Retained<NSView> {
+    let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("browser"), None) }
+        .and_then(|view| view.downcast::<NSTableCellView>().ok())
+        .unwrap_or_else(|| {
+            let mtm = table.mtm();
+            let cell = NSTableCellView::new(mtm);
+            cell.setIdentifier(Some(ns_string!("browser")));
+            let icon = NSImageView::new(mtm);
+            icon.setTranslatesAutoresizingMaskIntoConstraints(false);
+            let text = label("", mtm);
+            text.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(&icon);
+            cell.addSubview(&text);
+            unsafe {
+                cell.setTextField(Some(&text));
+                cell.setImageView(Some(&icon));
+            }
+            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                icon.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&cell.leadingAnchor(), icon_inset),
+                icon.centerYAnchor()
+                    .constraintEqualToAnchor(&cell.centerYAnchor()),
+                icon.widthAnchor().constraintEqualToConstant(28.0),
+                icon.heightAnchor().constraintEqualToConstant(28.0),
+                text.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&icon.trailingAnchor(), 12.0),
+                text.trailingAnchor()
+                    .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -8.0),
+                text.centerYAnchor()
+                    .constraintEqualToAnchor(&cell.centerYAnchor()),
+            ]));
+            cell
+        });
+    unsafe { cell.textField() }
+        .expect("browser cell text subview")
+        .setStringValue(&NSString::from_str(&browser.name));
+    unsafe { cell.imageView() }
+        .expect("browser cell image subview")
+        .setImage(Some(&browser.icon));
     cell.setToolTip(Some(&NSString::from_str(&browser.path)));
-    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-        icon.leadingAnchor()
-            .constraintEqualToAnchor_constant(&cell.leadingAnchor(), icon_inset),
-        icon.centerYAnchor()
-            .constraintEqualToAnchor(&cell.centerYAnchor()),
-        icon.widthAnchor().constraintEqualToConstant(28.0),
-        icon.heightAnchor().constraintEqualToConstant(28.0),
-        text.leadingAnchor()
-            .constraintEqualToAnchor_constant(&icon.trailingAnchor(), 12.0),
-        text.trailingAnchor()
-            .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -8.0),
-        text.centerYAnchor()
-            .constraintEqualToAnchor(&cell.centerYAnchor()),
-    ]));
     Retained::into_super(cell)
 }
 
@@ -374,18 +399,40 @@ pub fn browser_toggle(
     browser: &Browser,
     index: usize,
     enabled: bool,
+    table: &NSTableView,
     target: &Delegate,
 ) -> Retained<NSView> {
-    let mtm = target.mtm();
-    let cell = NSTableCellView::new(mtm);
-    let toggle = unsafe {
-        NSButton::checkboxWithTitle_target_action(
-            ns_string!(""),
-            Some(target),
-            Some(sel!(toggleBrowser:)),
-            mtm,
-        )
-    };
+    let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("enabled"), None) }
+        .and_then(|view| view.downcast::<NSTableCellView>().ok())
+        .unwrap_or_else(|| {
+            let mtm = target.mtm();
+            let cell = NSTableCellView::new(mtm);
+            cell.setIdentifier(Some(ns_string!("enabled")));
+            let toggle = unsafe {
+                NSButton::checkboxWithTitle_target_action(
+                    ns_string!(""),
+                    Some(target),
+                    Some(sel!(toggleBrowser:)),
+                    mtm,
+                )
+            };
+            toggle.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(&toggle);
+            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                toggle
+                    .centerXAnchor()
+                    .constraintEqualToAnchor(&cell.centerXAnchor()),
+                toggle
+                    .centerYAnchor()
+                    .constraintEqualToAnchor(&cell.centerYAnchor()),
+            ]));
+            cell
+        });
+    let toggle = cell
+        .subviews()
+        .objectAtIndex(0)
+        .downcast::<NSButton>()
+        .expect("browser toggle subview");
     toggle.setTag(index as isize);
     toggle.setState(if enabled {
         NSControlStateValueOn
@@ -395,16 +442,6 @@ pub fn browser_toggle(
     let description = NSString::from_str(&format!("Show {} in the browser chooser", browser.name));
     toggle.setAccessibilityLabel(Some(&description));
     toggle.setToolTip(Some(&description));
-    toggle.setTranslatesAutoresizingMaskIntoConstraints(false);
-    cell.addSubview(&toggle);
-    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-        toggle
-            .centerXAnchor()
-            .constraintEqualToAnchor(&cell.centerXAnchor()),
-        toggle
-            .centerYAnchor()
-            .constraintEqualToAnchor(&cell.centerYAnchor()),
-    ]));
     Retained::into_super(cell)
 }
 

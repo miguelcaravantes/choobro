@@ -12,6 +12,22 @@ mod delegate {
     use objc2_foundation::NSIndexSet;
 
     pub fn smoke_test() {
+        if std::env::args().any(|argument| argument == "--all-excluded") {
+            autoreleasepool(|_| {
+                let ids: Vec<_> = browsers::discover_all()
+                    .iter()
+                    .map(|browser| NSString::from_str(&browser.id))
+                    .collect();
+                let domain = objc2_foundation::NSDictionary::<NSString, AnyObject>::from_slices(
+                    &[ns_string!("ExcludedBrowsers")],
+                    &[&*NSArray::from_retained_slice(&ids)],
+                );
+                unsafe {
+                    objc2_foundation::NSUserDefaults::standardUserDefaults()
+                        .setVolatileDomain_forName(&domain, objc2_foundation::NSArgumentDomain);
+                }
+            });
+        }
         let will_launch = RcBlock::new(|_notification: std::ptr::NonNull<NSNotification>| {
             with_delegate(|delegate| {
                 assert!(!delegate.ivars().ready.get());
@@ -40,6 +56,10 @@ mod delegate {
                 with_delegate(|delegate| {
                     let state = delegate.ivars();
                     assert!(state.ready.get());
+                    assert!(!state.showing_rejection.replace(true));
+                    delegate.rejected_link(Rejection::Full);
+                    delegate.rejected_link(Rejection::Unsupported);
+                    assert!(state.showing_rejection.replace(false));
                     let chooser = state.chooser.get().unwrap();
                     assert!(chooser.window.isVisible());
                     assert!(
@@ -56,7 +76,22 @@ mod delegate {
                     assert!(!chooser.window.isReleasedWhenClosed());
                     assert!(chooser.window.contentViewController().is_some());
                     assert_eq!(chooser.open.action(), Some(sel!(openBrowser:)));
-                    assert_eq!(chooser.open.keyEquivalent().to_string(), "\r");
+                    assert_eq!(chooser.open.isEnabled(), state.app.browser_count() > 0);
+                    if chooser.open.isEnabled() {
+                        assert_eq!(chooser.open.keyEquivalent().to_string(), "\r");
+                    }
+                    if std::env::args().any(|argument| argument == "--all-excluded") {
+                        assert_eq!(state.app.browser_count(), 0);
+                        assert!(chooser.copy.isEnabled());
+                        assert!(chooser.cancel.isEnabled());
+                        assert!(
+                            chooser
+                                .message
+                                .stringValue()
+                                .to_string()
+                                .contains("No enabled browsers")
+                        );
+                    }
                     assert_eq!(chooser.cancel.action(), Some(sel!(cancelRequest:)));
                     assert_eq!(chooser.cancel.keyEquivalent().to_string(), "\u{1b}");
                     assert!(state.settings.borrow().is_none());
@@ -259,7 +294,13 @@ mod delegate {
                         );
                         if let Some(browser) = state.app.settings_browser(0) {
                             for enabled in [false, true] {
-                                let view = ui::browser_toggle(&browser, 0, enabled, delegate);
+                                let view = ui::browser_toggle(
+                                    &browser,
+                                    0,
+                                    enabled,
+                                    &settings.table,
+                                    delegate,
+                                );
                                 let toggle = view
                                     .subviews()
                                     .objectAtIndex(0)
@@ -275,7 +316,7 @@ mod delegate {
                                         .contains(&browser.name)
                                 );
                             }
-                            let cell = ui::browser_cell(&browser, delegate.mtm(), 0.0)
+                            let cell = ui::browser_cell(&browser, &settings.table, 0.0)
                                 .downcast::<NSTableCellView>()
                                 .unwrap();
                             assert_eq!(
@@ -308,6 +349,7 @@ mod delegate {
                             }
                         }
                         settings.update(0, browsers::manual_order());
+                        check_cell_reuse(delegate, &settings.table);
                         unsafe { settings.table.setDataSource(None) };
                         settings.update(0, true);
                         assert_eq!(settings.table.numberOfRows(), 0);
@@ -376,6 +418,52 @@ mod delegate {
                         chooser.preview.stringValue().to_string(),
                         "https://example.invalid/a%2Fb?x=a%26b#test"
                     );
+                    if state.app.browser_count() > 1 {
+                        chooser
+                            .table
+                            .scrollRowToVisible(state.app.browser_count() as isize - 1);
+                        let content = chooser.window.contentView().unwrap();
+                        content.layoutSubtreeIfNeeded();
+                        chooser.update(
+                            Some(&crate::app::ChooserContent {
+                                preview: state.app.preview().unwrap(),
+                                selected_row: 0,
+                                count: 1,
+                            }),
+                            state.app.browser_count(),
+                            false,
+                            delegate.mtm(),
+                        );
+                        content.layoutSubtreeIfNeeded();
+                        let selected = chooser.table.rectOfRow(0);
+                        let visible = chooser.table.visibleRect();
+                        assert!(selected.origin.y >= visible.origin.y);
+                        assert!(
+                            selected.origin.y + selected.size.height
+                                <= visible.origin.y + visible.size.height
+                        );
+                    }
+                    unsafe { chooser.table.setDataSource(None) };
+                    chooser.table.reloadData();
+                    assert_eq!(chooser.table.numberOfRows(), 0);
+                    unsafe {
+                        chooser
+                            .table
+                            .setDataSource(Some(ProtocolObject::from_ref(delegate)))
+                    };
+                    chooser.window.orderOut(None);
+                    delegate.show_settings(sel!(showSettings:), None);
+                    assert_eq!(
+                        chooser.table.numberOfRows(),
+                        state.app.browser_count() as isize
+                    );
+                    assert!(state.settings.borrow().as_ref().unwrap().window.isVisible());
+                    assert!(!chooser.window.isVisible());
+                    delegate.refresh_chooser(true);
+                    assert_eq!(
+                        chooser.preview.stringValue().to_string(),
+                        "https://example.invalid/a%2Fb?x=a%26b#test"
+                    );
                     snapshot(
                         &chooser.window.contentView().unwrap(),
                         ns_string!("target/native-chooser.png"),
@@ -406,7 +494,7 @@ mod delegate {
                     );
                     delegate.dispatch_finished(false, "Test Browser");
                     assert!(chooser.window.isVisible());
-                    assert!(chooser.open.isEnabled());
+                    assert_eq!(chooser.open.isEnabled(), state.app.browser_count() > 0);
                     assert!(chooser.copy.isEnabled());
                     assert_eq!(chooser.table.selectedRow(), selected);
                     assert!(
@@ -416,6 +504,13 @@ mod delegate {
                             .to_string()
                             .contains("Could not open Test Browser")
                     );
+                    chooser.dispatch_failed("Firefox Developer Edition", delegate.mtm());
+                    let content = chooser.window.contentView().unwrap();
+                    content.layoutSubtreeIfNeeded();
+                    assert!(chooser.message.cell().unwrap().wraps());
+                    assert!(!chooser.message.isSelectable());
+                    assert!(chooser.message.frame().size.height > 20.0);
+                    assert!(chooser.message.frame().size.width <= 437.0);
                     assert!(state.app.begin_dispatch().is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.window.isVisible());
@@ -526,6 +621,63 @@ mod delegate {
         run();
     }
 
+    fn check_cell_reuse(delegate: &Delegate, table: &NSTableView) {
+        let views: Vec<_> = (0..table.numberOfRows())
+            .filter_map(|row| table.viewAtColumn_row_makeIfNecessary(1, row, true))
+            .map(|view| (view.constraints().len(), view))
+            .collect();
+        if views.is_empty() {
+            return;
+        }
+        delegate.update_settings(0);
+        table
+            .window()
+            .unwrap()
+            .contentView()
+            .unwrap()
+            .layoutSubtreeIfNeeded();
+        let mut reused = false;
+        for row in 0..table.numberOfRows() {
+            let browser = delegate.ivars().app.settings_browser(row as usize).unwrap();
+            if let Some(view) = table.viewAtColumn_row_makeIfNecessary(1, row, true) {
+                if let Some((count, _)) = views.iter().find(|(_, old)| **old == *view) {
+                    reused = true;
+                    assert_eq!(view.constraints().len(), *count);
+                }
+                let cell = view.downcast::<NSTableCellView>().unwrap();
+                assert_eq!(
+                    unsafe { cell.textField() }
+                        .unwrap()
+                        .stringValue()
+                        .to_string(),
+                    browser.name
+                );
+                assert_eq!(cell.toolTip().unwrap().to_string(), browser.path);
+                assert_eq!(cell.subviews().len(), 2);
+                assert_eq!(cell.identifier().as_deref(), Some(ns_string!("browser")));
+            }
+            if let Some(view) = table.viewAtColumn_row_makeIfNecessary(0, row, true) {
+                let toggle = view
+                    .subviews()
+                    .objectAtIndex(0)
+                    .downcast::<NSButton>()
+                    .unwrap();
+                assert_eq!(toggle.tag(), row);
+                assert_eq!(
+                    toggle.state() == NSControlStateValueOn,
+                    !browsers::exclusions().contains(&browser.id)
+                );
+                assert!(
+                    NSAccessibility::accessibilityLabel(&*toggle)
+                        .unwrap()
+                        .to_string()
+                        .contains(&browser.name)
+                );
+            }
+        }
+        assert!(reused, "settings refresh must reuse native browser cells");
+    }
+
     fn snapshot(view: &NSView, path: &objc2_foundation::NSString) {
         view.window().unwrap().displayIfNeeded();
         let bitmap = view
@@ -544,5 +696,5 @@ mod delegate {
 }
 
 fn main() {
-    delegate::smoke_test();
+    objc2::rc::autoreleasepool(|_| delegate::smoke_test());
 }

@@ -102,6 +102,23 @@ fn eligible(id: &str, path: &str, own_path: &str) -> bool {
 }
 
 pub fn discover(schemes: &BTreeSet<String>) -> Vec<Browser> {
+    discover_handlers(schemes, true)
+}
+
+pub fn discover_all() -> Vec<Browser> {
+    discover_handlers(&BTreeSet::from(["http".into(), "https".into()]), false)
+}
+
+fn matching_paths(supported_paths: &[BTreeSet<String>], require_all: bool) -> BTreeSet<String> {
+    supported_paths
+        .iter()
+        .flatten()
+        .filter(|path| !require_all || supported_paths.iter().all(|paths| paths.contains(*path)))
+        .cloned()
+        .collect()
+}
+
+fn discover_handlers(schemes: &BTreeSet<String>, require_all: bool) -> Vec<Browser> {
     let workspace = NSWorkspace::sharedWorkspace();
     let own_path = NSBundle::mainBundle().bundlePath().to_string();
     let mut candidates = Vec::new();
@@ -119,16 +136,13 @@ pub fn discover(schemes: &BTreeSet<String>) -> Vec<Browser> {
         );
         candidates.extend(applications.iter());
     }
-    let mut seen = BTreeSet::new();
+    let mut supported_paths = matching_paths(&supported_paths, require_all);
     let mut browsers = Vec::new();
     for url in candidates {
         let Some(path) = url.path().map(|value| value.to_string()) else {
             continue;
         };
-        if !seen.insert(path.clone())
-            || !supported_paths.iter().all(|paths| paths.contains(&path))
-            || !Path::new(&path).is_dir()
-        {
+        if !supported_paths.remove(&path) || !Path::new(&path).is_dir() {
             continue;
         }
         let Some(bundle) = NSBundle::bundleWithURL(&url) else {
@@ -221,14 +235,21 @@ pub fn is_app_bundle() -> bool {
         .is_some_and(|id| id.to_string() == BUNDLE_ID)
 }
 
+fn open_configuration() -> Retained<NSWorkspaceOpenConfiguration> {
+    let configuration = NSWorkspaceOpenConfiguration::new();
+    configuration.setActivates(true);
+    configuration.setAllowsRunningApplicationSubstitution(false);
+    configuration.setAddsToRecentItems(false);
+    configuration
+}
+
 pub fn open(browser: &Browser, urls: &NSArray<NSURL>, finished: impl Fn(bool) + Send + 'static) {
     let completion = RcBlock::new(
         move |_app: *mut NSRunningApplication, error: *mut NSError| {
             finished(error.is_null());
         },
     );
-    let configuration = NSWorkspaceOpenConfiguration::new();
-    configuration.setActivates(true);
+    let configuration = open_configuration();
     NSWorkspace::sharedWorkspace().openURLs_withApplicationAtURL_configuration_completionHandler(
         urls,
         &browser.url,
@@ -260,6 +281,33 @@ mod tests {
             url: NSURL::fileURLWithPath(&NSString::from_str(path)),
             icon: NSImage::new(),
         }
+    }
+
+    #[test]
+    fn dispatch_uses_the_selected_installation_without_recording_recent_items() {
+        let configuration = open_configuration();
+        assert!(configuration.activates());
+        assert!(!configuration.allowsRunningApplicationSubstitution());
+        assert!(!configuration.addsToRecentItems());
+    }
+
+    #[test]
+    fn settings_include_single_scheme_handlers_but_requests_require_every_scheme() {
+        let supported = [
+            BTreeSet::from(["http-only".into(), "both".into()]),
+            BTreeSet::from(["https-only".into(), "both".into()]),
+        ];
+        assert_eq!(
+            matching_paths(&supported, true),
+            BTreeSet::from(["both".into()])
+        );
+        assert_eq!(
+            matching_paths(&supported, false),
+            BTreeSet::from(["http-only".into(), "https-only".into(), "both".into()])
+        );
+        assert_eq!(matching_paths(&supported[..1], true), supported[0]);
+        assert!(matching_paths(&[], true).is_empty());
+        assert!(matching_paths(&[supported[0].clone(), BTreeSet::new()], true).is_empty());
     }
 
     #[test]

@@ -48,6 +48,8 @@ Open ChooBro, click **Make Default Browser…** in Settings, and approve the mac
 
 Links arriving together open in one browser; later requests wait their turn. Pending links stay in memory, not on disk. Quitting asks before discarding them.
 
+The queue holds up to 256 links and 8 MiB of URL text. A request that exceeds either limit is rejected as a whole with a message; already queued links stay intact.
+
 ## Update
 
 Quit ChooBro, then:

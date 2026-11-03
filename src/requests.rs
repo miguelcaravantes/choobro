@@ -1,7 +1,31 @@
 use std::collections::VecDeque;
 
-use objc2::{Message, rc::Retained};
-use objc2_foundation::{NSArray, NSURL};
+use objc2::rc::Retained;
+use objc2_foundation::{NSArray, NSCopying, NSURL, NSUTF8StringEncoding};
+
+const MAX_PENDING_URLS: usize = 256;
+const MAX_PENDING_URL_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rejection {
+    Unsupported,
+    Full,
+}
+
+impl Rejection {
+    pub fn message(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Unsupported => (
+                "Unsupported link",
+                "ChooBro accepts only absolute HTTP and HTTPS links with a host. This request was not opened.",
+            ),
+            Self::Full => (
+                "Pending link limit reached",
+                "This request was not added. ChooBro holds up to 256 pending links and 8 MiB of URL text. Open or cancel pending links, or send a smaller batch, then try again.",
+            ),
+        }
+    }
+}
 
 pub fn is_web_url(url: &NSURL) -> bool {
     url.baseURL().is_none()
@@ -16,28 +40,57 @@ pub fn is_web_url(url: &NSURL) -> bool {
 
 #[derive(Default)]
 pub struct Requests {
-    pending: VecDeque<Retained<NSArray<NSURL>>>,
+    pending: VecDeque<Pending>,
+    pending_urls: usize,
+    pending_bytes: usize,
     pub in_flight: bool,
 }
 
+struct Pending {
+    urls: Retained<NSArray<NSURL>>,
+    bytes: usize,
+}
+
 impl Requests {
-    pub fn push(&mut self, urls: &NSArray<NSURL>) -> bool {
-        if urls.is_empty() || !urls.iter().all(|url| is_web_url(&url)) {
-            return false;
+    pub fn push(&mut self, urls: &NSArray<NSURL>) -> Result<(), Rejection> {
+        if urls.is_empty() {
+            return Err(Rejection::Unsupported);
         }
-        self.pending.push_back(urls.retain());
-        true
+        if urls.len() > MAX_PENDING_URLS - self.pending_urls {
+            return Err(Rejection::Full);
+        }
+        let urls = urls.copy();
+        let mut bytes = 0;
+        for url in &*urls {
+            let value = url.absoluteString().ok_or(Rejection::Unsupported)?;
+            let remaining = MAX_PENDING_URL_BYTES - self.pending_bytes - bytes;
+            if value.len() > remaining {
+                return Err(Rejection::Full);
+            }
+            let length = value.lengthOfBytesUsingEncoding(NSUTF8StringEncoding);
+            if length > remaining {
+                return Err(Rejection::Full);
+            }
+            if !is_web_url(&url) {
+                return Err(Rejection::Unsupported);
+            }
+            bytes += length;
+        }
+        self.pending_urls += urls.len();
+        self.pending_bytes += bytes;
+        self.pending.push_back(Pending { urls, bytes });
+        Ok(())
     }
 
     pub fn current(&self) -> Option<&NSArray<NSURL>> {
-        self.pending.front().map(|urls| &**urls)
+        self.pending.front().map(|pending| &*pending.urls)
     }
 
     pub fn begin(&mut self) -> Option<Retained<NSArray<NSURL>>> {
         if self.in_flight {
             return None;
         }
-        let urls = self.pending.front()?.clone();
+        let urls = self.pending.front()?.urls.clone();
         self.in_flight = true;
         Some(urls)
     }
@@ -48,13 +101,20 @@ impl Requests {
         }
         self.in_flight = false;
         if success {
-            self.pending.pop_front();
+            self.remove_current();
         }
     }
 
     pub fn cancel(&mut self) {
         if !self.in_flight {
-            self.pending.pop_front();
+            self.remove_current();
+        }
+    }
+
+    fn remove_current(&mut self) {
+        if let Some(pending) = self.pending.pop_front() {
+            self.pending_urls -= pending.urls.len();
+            self.pending_bytes -= pending.bytes;
         }
     }
 }
@@ -92,7 +152,7 @@ mod tests {
     fn retains_encoding_query_and_fragment() {
         let value = "https://example.com/a%2Fb?q=a%26b&token=secret#part%202";
         let mut requests = Requests::default();
-        assert!(requests.push(&urls(value)));
+        assert_eq!(requests.push(&urls(value)), Ok(()));
         assert_eq!(
             requests
                 .begin()
@@ -116,9 +176,9 @@ mod tests {
     #[test]
     fn empty_requests_and_unsolicited_completions_do_nothing() {
         let mut requests = Requests::default();
-        assert!(!requests.push(&NSArray::new()));
+        assert_eq!(requests.push(&NSArray::new()), Err(Rejection::Unsupported));
         assert!(requests.begin().is_none());
-        requests.push(&urls("https://example.com"));
+        requests.push(&urls("https://example.com")).unwrap();
         requests.finish(true);
         assert!(requests.current().is_some());
         requests.cancel();
@@ -133,17 +193,19 @@ mod tests {
             urls("https://example.com").objectAtIndex(0),
             urls("file:///private").objectAtIndex(0),
         ]);
-        assert!(!requests.push(&batch));
+        assert_eq!(requests.push(&batch), Err(Rejection::Unsupported));
         assert!(requests.current().is_none());
+        assert_eq!(requests.pending_urls, 0);
+        assert_eq!(requests.pending_bytes, 0);
     }
 
     #[test]
     fn queues_deliveries_while_launching_and_retries_failures() {
         let mut requests = Requests::default();
-        requests.push(&urls("https://first.example"));
+        requests.push(&urls("https://first.example")).unwrap();
         assert!(requests.begin().is_some());
         assert!(requests.begin().is_none());
-        requests.push(&urls("https://second.example"));
+        requests.push(&urls("https://second.example")).unwrap();
         requests.cancel();
         requests.finish(false);
         assert_eq!(
@@ -170,5 +232,75 @@ mod tests {
         );
         requests.cancel();
         assert!(requests.current().is_none());
+    }
+
+    #[test]
+    fn count_limit_rejects_whole_batches_and_recovers_after_dispatch_or_cancel() {
+        let mut requests = Requests::default();
+        let url = urls("https://example.com").objectAtIndex(0);
+        let batch = NSArray::from_retained_slice(&vec![url.clone(); MAX_PENDING_URLS - 1]);
+        requests.push(&batch).unwrap();
+        let pair = NSArray::from_retained_slice(&[url.clone(), url.clone()]);
+        assert_eq!(requests.push(&pair), Err(Rejection::Full));
+        assert_eq!(requests.pending_urls, MAX_PENDING_URLS - 1);
+        requests
+            .push(&NSArray::from_retained_slice(std::slice::from_ref(&url)))
+            .unwrap();
+        assert_eq!(requests.push(&pair), Err(Rejection::Full));
+        requests.begin().unwrap();
+        requests.cancel();
+        requests.finish(false);
+        assert_eq!(requests.push(&pair), Err(Rejection::Full));
+        requests.begin().unwrap();
+        requests.finish(true);
+        requests.push(&pair).unwrap();
+        requests.cancel();
+        requests.cancel();
+        assert_eq!(requests.pending_urls, 0);
+        assert_eq!(requests.pending_bytes, 0);
+        let oversized = NSArray::from_retained_slice(&vec![url; MAX_PENDING_URLS + 1]);
+        assert_eq!(requests.push(&oversized), Err(Rejection::Full));
+        assert!(requests.current().is_none());
+    }
+
+    #[test]
+    fn byte_limit_is_atomic_and_released_when_a_request_is_removed() {
+        let mut requests = Requests::default();
+        let prefix = "https://example.com/";
+        let value = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_PENDING_URL_BYTES / 2 - prefix.len())
+        );
+        let half = urls(&value).objectAtIndex(0);
+        let batch = NSArray::from_retained_slice(&[half.clone(), half]);
+        requests.push(&batch).unwrap();
+        assert_eq!(requests.pending_bytes, MAX_PENDING_URL_BYTES);
+        assert_eq!(requests.push(&urls(prefix)), Err(Rejection::Full));
+        requests.begin().unwrap();
+        requests.finish(false);
+        assert_eq!(requests.pending_bytes, MAX_PENDING_URL_BYTES);
+        requests.cancel();
+        requests.push(&urls(prefix)).unwrap();
+        assert_eq!(requests.push(&batch), Err(Rejection::Full));
+        assert_eq!(requests.pending_urls, 1);
+        assert_eq!(requests.pending_bytes, prefix.len());
+        requests.begin().unwrap();
+        requests.finish(true);
+        assert_eq!(requests.pending_bytes, 0);
+        assert_eq!(requests.pending_urls, 0);
+    }
+
+    #[test]
+    fn queued_batches_are_immutable_snapshots_of_the_delivered_array() {
+        let batch = objc2_foundation::NSMutableArray::new();
+        batch.addObjectsFromArray(&urls("https://example.com"));
+        let mut requests = Requests::default();
+        requests.push(&batch).unwrap();
+        batch.removeAllObjects();
+        assert_eq!(requests.current().unwrap().len(), 1);
+        assert_eq!(requests.pending_urls, 1);
+        requests.cancel();
+        assert_eq!(requests.pending_urls, 0);
+        assert_eq!(requests.pending_bytes, 0);
     }
 }

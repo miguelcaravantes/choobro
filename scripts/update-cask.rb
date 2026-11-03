@@ -1,7 +1,7 @@
 require "rubygems"
 
 def updated_cask(source, version, checksum)
-  raise ArgumentError, "Invalid release version" unless version.match?(/\A\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?\z/)
+  raise ArgumentError, "Release version must be numeric MAJOR.MINOR.PATCH" unless version.match?(/\A(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\z/)
   raise ArgumentError, "Invalid SHA-256 checksum" unless checksum.match?(/\A[0-9a-f]{64}\z/)
 
   versions = source.scan(/^  version "([^"]+)"$/).flatten

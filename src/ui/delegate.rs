@@ -3,7 +3,7 @@ use std::cell::{Cell, OnceCell, RefCell};
 use block2::RcBlock;
 use objc2::{
     DefinedClass, MainThreadOnly, define_class, msg_send,
-    rc::Retained,
+    rc::{Retained, autoreleasepool},
     runtime::{AnyObject, ProtocolObject},
     sel,
 };
@@ -15,7 +15,9 @@ use objc2_foundation::{
 
 use crate::{
     app::{App, Incoming, OpenRequest},
-    browsers, ui,
+    browsers,
+    requests::Rejection,
+    ui,
 };
 
 thread_local! {
@@ -29,7 +31,8 @@ pub struct State {
     chooser: OnceCell<ui::Chooser>,
     settings: RefCell<Option<ui::Settings>>,
     status_item: OnceCell<Retained<NSStatusItem>>,
-    rejected_request: Cell<bool>,
+    rejected_request: Cell<Option<Rejection>>,
+    showing_rejection: Cell<bool>,
 }
 
 define_class!(
@@ -58,8 +61,8 @@ define_class!(
             } else {
                 self.show_settings(sel!(showSettings:), None);
             }
-            if self.ivars().rejected_request.replace(false) {
-                self.unsupported_link();
+            if let Some(reason) = self.ivars().rejected_request.take() {
+                self.rejected_link(reason);
             }
         }
 
@@ -68,8 +71,8 @@ define_class!(
             match self.ivars().app.receive(urls) {
                 Incoming::Show => self.refresh_chooser(true),
                 Incoming::Queued => {},
-                Incoming::Rejected if self.ivars().ready.get() => self.unsupported_link(),
-                Incoming::Rejected => self.ivars().rejected_request.set(true),
+                Incoming::Rejected(reason) if self.ivars().ready.get() => self.rejected_link(reason),
+                Incoming::Rejected(reason) => self.ivars().rejected_request.set(Some(reason)),
             }
         }
 
@@ -144,12 +147,12 @@ define_class!(
                     let browser = self.ivars().app.settings_browser(row)?;
                     if column.is_some_and(|column| &*column.identifier() == ns_string!("enabled")) {
                         let enabled = !browsers::exclusions().contains(&browser.id);
-                        Some(ui::browser_toggle(&browser, row, enabled, self))
+                        Some(ui::browser_toggle(&browser, row, enabled, table, self))
                     } else {
-                        Some(ui::browser_cell(&browser, self.mtm(), 0.0))
+                        Some(ui::browser_cell(&browser, table, 0.0))
                     }
                 } else {
-                    self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, self.mtm(), 8.0))
+                    self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, table, 8.0))
                 }
             })
         }
@@ -175,6 +178,7 @@ define_class!(
         fn show_settings(&self, _sender: Option<&AnyObject>) {
             let selected = self.settings_selection();
             self.refresh_settings(selected);
+            self.refresh_chooser(false);
             if let Some(settings) = &*self.ivars().settings.borrow() {
                 ui::present(&settings.window, self.mtm());
             }
@@ -193,9 +197,7 @@ define_class!(
         fn toggle_browser(&self, sender: &NSButton) {
             if let Ok(index) = usize::try_from(sender.tag()) {
                 self.ivars().app.set_browser_enabled(index, sender.state() == NSControlStateValueOn);
-                if let Some(settings) = &*self.ivars().settings.borrow() {
-                    settings.update(index, browsers::manual_order());
-                }
+                self.update_settings(index);
             }
             self.refresh_chooser(false);
         }
@@ -300,7 +302,7 @@ impl Delegate {
         let Some(destination) = self.ivars().app.drop_browser(&path, insertion) else {
             return false;
         };
-        self.refresh_settings(Some(destination));
+        self.update_settings(destination);
         self.refresh_chooser(false);
         true
     }
@@ -344,10 +346,14 @@ impl Delegate {
             let settings = ui::settings(self, self.ivars().app.configuring());
             self.ivars().settings.borrow_mut().replace(settings);
         }
+        self.update_settings(selected_row);
+        self.refresh_default_status();
+    }
+
+    fn update_settings(&self, selected_row: usize) {
         if let Some(settings) = &*self.ivars().settings.borrow() {
             settings.update(selected_row, browsers::manual_order());
         }
-        self.refresh_default_status();
     }
 
     fn refresh_default_status(&self) {
@@ -362,7 +368,11 @@ impl Delegate {
         if let Some(index) = self.settings_selection()
             && self.ivars().app.move_browser(index, offset)
         {
-            self.refresh_settings(index.checked_add_signed(offset));
+            self.update_settings(
+                index
+                    .checked_add_signed(offset)
+                    .expect("valid browser move"),
+            );
             self.refresh_chooser(false);
         }
     }
@@ -375,12 +385,13 @@ impl Delegate {
         }
     }
 
-    fn unsupported_link(&self) {
-        ui::alert(
-            "Unsupported link",
-            "ChooBro accepts only absolute HTTP and HTTPS links with a host. This request was not opened.",
-            self.mtm(),
-        );
+    fn rejected_link(&self, reason: Rejection) {
+        if self.ivars().showing_rejection.replace(true) {
+            return;
+        }
+        let (title, detail) = reason.message();
+        ui::alert(title, detail, self.mtm());
+        self.ivars().showing_rejection.set(false);
     }
 
     fn refresh_chooser(&self, present: bool) {
@@ -458,12 +469,15 @@ pub fn run() {
         )
     }));
     let mtm = MainThreadMarker::new().expect("application starts on the main thread");
-    let app = NSApplication::sharedApplication(mtm);
-    let delegate = Delegate::alloc(mtm).set_ivars(State::default());
-    let delegate: Retained<Delegate> = unsafe { msg_send![super(delegate), init] };
-    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
-    DELEGATE.with(|cell| {
-        let _ = cell.set(delegate);
+    let app = autoreleasepool(|_| {
+        let app = NSApplication::sharedApplication(mtm);
+        let delegate = Delegate::alloc(mtm).set_ivars(State::default());
+        let delegate: Retained<Delegate> = unsafe { msg_send![super(delegate), init] };
+        app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
+        DELEGATE.with(|cell| {
+            let _ = cell.set(delegate);
+        });
+        app
     });
     app.run();
 }

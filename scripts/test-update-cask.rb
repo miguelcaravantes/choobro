@@ -9,11 +9,18 @@ raise "Version was not updated" unless updated.include?('version "0.2.0"')
 raise "Checksum was not updated" unless updated.include?("sha256 \"#{checksum}\"")
 raise "Downgraded the cask" unless updated_cask(updated, "0.1.0", "a" * 64) == updated
 raise "Changed an identical release" unless updated_cask(updated, "0.2.0", checksum) == updated
-raise "Failed prerelease ordering" unless updated_cask(updated, "0.2.0-beta.1", "a" * 64) == updated
+raise "Compared versions as strings" unless updated_cask(updated, "0.10.0", checksum).include?('version "0.10.0"')
 
 [
   [source, "0.1.0", checksum],
   [source, "invalid", checksum],
+  [source, "0.2.0-beta.1", checksum],
+  [source, "1.0.0-beta2", checksum],
+  [source, "1.0.0-beta10", checksum],
+  [source, "0.2.0+build.1", checksum],
+  [source, "00.2.0", checksum],
+  [source, "0.02.0", checksum],
+  [source, "0.2.00", checksum],
   [source, "0.2.0", "invalid"],
   ["", "0.2.0", checksum],
   [source + source, "0.2.0", checksum]
