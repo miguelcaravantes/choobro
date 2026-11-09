@@ -38,6 +38,46 @@ pub fn set_excluded(id: &str, excluded: bool) {
     }
 }
 
+pub struct AutoOpen {
+    pub enabled: bool,
+    pub seconds: f64,
+    pub browser_id: String,
+}
+
+impl AutoOpen {
+    pub fn load() -> Self {
+        Self::from_defaults(&NSUserDefaults::standardUserDefaults())
+    }
+
+    fn from_defaults(defaults: &NSUserDefaults) -> Self {
+        let seconds = defaults.doubleForKey(ns_string!("AutoOpenSeconds"));
+        Self {
+            enabled: defaults.boolForKey(ns_string!("AutoOpenEnabled")),
+            seconds: if valid_timeout(seconds) { seconds } else { 5.0 },
+            browser_id: defaults
+                .stringForKey(ns_string!("AutoOpenBrowser"))
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
+        }
+    }
+
+    pub fn save(&self) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        defaults.setBool_forKey(self.enabled, ns_string!("AutoOpenEnabled"));
+        defaults.setDouble_forKey(self.seconds, ns_string!("AutoOpenSeconds"));
+        unsafe {
+            defaults.setObject_forKey(
+                Some(&NSString::from_str(&self.browser_id)),
+                ns_string!("AutoOpenBrowser"),
+            );
+        }
+    }
+}
+
+pub fn valid_timeout(seconds: f64) -> bool {
+    seconds.is_finite() && seconds > 0.0
+}
+
 pub fn manual_order() -> bool {
     NSUserDefaults::standardUserDefaults().boolForKey(ns_string!("ManualBrowserOrder"))
 }
@@ -280,6 +320,37 @@ mod tests {
             path: path.into(),
             url: NSURL::fileURLWithPath(&NSString::from_str(path)),
             icon: NSImage::new(),
+        }
+    }
+
+    #[test]
+    fn auto_open_is_opt_in_and_rejects_invalid_intervals() {
+        use objc2::AnyThread;
+        let defaults = NSUserDefaults::initWithSuiteName(
+            NSUserDefaults::alloc(),
+            Some(ns_string!(
+                "io.github.miguelcaravantes.choobro.timeout-tests"
+            )),
+        )
+        .unwrap();
+        let values =
+            objc2_foundation::NSDictionary::<NSString, objc2::runtime::AnyObject>::from_slices(
+                &[ns_string!("AutoOpenEnabled"), ns_string!("AutoOpenSeconds")],
+                &[
+                    &*objc2_foundation::NSNumber::new_bool(false),
+                    &*objc2_foundation::NSNumber::new_f64(0.0),
+                ],
+            );
+        unsafe {
+            defaults.setVolatileDomain_forName(&values, objc2_foundation::NSArgumentDomain);
+        }
+        let preference = AutoOpen::from_defaults(&defaults);
+        assert!(!preference.enabled);
+        assert_eq!(preference.seconds, 5.0);
+        assert!(valid_timeout(0.25));
+        assert!(valid_timeout(86400.0));
+        for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(!valid_timeout(seconds));
         }
     }
 

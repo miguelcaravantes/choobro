@@ -45,6 +45,7 @@ Open ChooBro, click **Make Default Browser…** in Settings, and approve the mac
 - **Cancel:** press Escape or click Cancel.
 - **Copy:** click Copy Link or press ⌘C. You get the full URL, even when the preview ends in an ellipsis; the chooser stays open.
 - **Customize:** click **CB → Settings** in the menu bar to hide browsers or refresh the list. Browsers are alphabetical by default; choose **Sort → Manual**, then drag browsers or use the arrows beside the list to set the chooser order. Your manual order is saved when you switch back to alphabetical. New browsers appear at the end in manual mode.
+- **Optional auto-open:** in Settings, enable **Automatically open a browser after waiting**, enter a positive delay in seconds (decimals work), and choose a browser. This is off by default. Keyboard or mouse interaction in the chooser, copying a link, or opening Settings cancels automatic opening for that request; it does not restart. Each later queued request gets its own delay. If the chosen browser is excluded or unavailable, the link stays in the chooser.
 
 Links arriving together open in one browser; later requests wait their turn. Pending links stay in memory, not on disk. Quitting asks before discarding them.
 

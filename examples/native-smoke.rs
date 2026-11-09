@@ -11,7 +11,36 @@ mod delegate {
     include!("../src/ui/delegate.rs");
     use objc2_foundation::NSIndexSet;
 
+    fn timeout_preferences(enabled: bool, browser_id: &str, excluded: &[String]) {
+        let ids: Vec<_> = excluded.iter().map(|id| NSString::from_str(id)).collect();
+        let values = objc2_foundation::NSDictionary::<NSString, AnyObject>::from_slices(
+            &[
+                ns_string!("AutoOpenEnabled"),
+                ns_string!("AutoOpenSeconds"),
+                ns_string!("AutoOpenBrowser"),
+                ns_string!("ExcludedBrowsers"),
+            ],
+            &[
+                &*objc2_foundation::NSNumber::new_bool(enabled),
+                &*objc2_foundation::NSNumber::new_f64(60.0),
+                &*NSString::from_str(browser_id),
+                &*NSArray::from_retained_slice(&ids),
+            ],
+        );
+        unsafe {
+            objc2_foundation::NSUserDefaults::standardUserDefaults()
+                .setVolatileDomain_forName(&values, objc2_foundation::NSArgumentDomain);
+        }
+    }
+
     pub fn smoke_test() {
+        autoreleasepool(|_| {
+            timeout_preferences(
+                false,
+                "",
+                &browsers::exclusions().into_iter().collect::<Vec<_>>(),
+            );
+        });
         if std::env::args().any(|argument| argument == "--all-excluded") {
             autoreleasepool(|_| {
                 let ids: Vec<_> = browsers::discover_all()
@@ -61,6 +90,53 @@ mod delegate {
                     delegate.rejected_link(Rejection::Unsupported);
                     assert!(state.showing_rejection.replace(false));
                     let chooser = state.chooser.get().unwrap();
+                    assert!(state.timeout.borrow().is_none());
+                    if let Some(browser) = state.app.browser(0) {
+                        let exclusions: Vec<_> = browsers::exclusions().into_iter().collect();
+                        delegate.cancel_request(sel!(cancelRequest:), None);
+                        timeout_preferences(true, &browser.id, &exclusions);
+                        let urls = NSArray::from_retained_slice(&[NSURL::URLWithString(
+                            ns_string!("https://example.invalid/timeout"),
+                        )
+                        .unwrap()]);
+                        delegate.open_urls(
+                            sel!(application:openURLs:),
+                            &NSApplication::sharedApplication(delegate.mtm()),
+                            &urls,
+                        );
+                        assert!(state.timeout.borrow().as_ref().unwrap().isValid());
+                        assert!(state.timeout_monitor.borrow().is_some());
+                        let timer = state.timeout.borrow().as_ref().unwrap().clone();
+                        delegate.selection_changed(sel!(tableViewSelectionDidChange:), &*unsafe {
+                            NSNotification::notificationWithName_object(
+                                ns_string!("NSTableViewSelectionDidChangeNotification"),
+                                Some(&chooser.table),
+                            )
+                        });
+                        assert!(!timer.isValid());
+                        assert!(state.timeout.borrow().is_none());
+                        assert!(state.timeout_monitor.borrow().is_none());
+                        delegate.refresh_chooser(true);
+                        assert!(state.timeout.borrow().is_none());
+                        delegate.timeout_fired(sel!(timeoutFired:), &timer);
+                        assert!(!state.app.busy());
+                        assert!(state.app.has_pending());
+                        delegate.cancel_request(sel!(cancelRequest:), None);
+                        delegate.open_urls(
+                            sel!(application:openURLs:),
+                            &NSApplication::sharedApplication(delegate.mtm()),
+                            &urls,
+                        );
+                        let timer = state.timeout.borrow().as_ref().unwrap().clone();
+                        let mut excluded = exclusions.clone();
+                        excluded.push(browser.id.clone());
+                        timeout_preferences(true, &browser.id, &excluded);
+                        timer.fire();
+                        assert!(state.timeout.borrow().is_none());
+                        assert!(!state.app.busy());
+                        assert!(state.app.has_pending());
+                        timeout_preferences(false, "", &exclusions);
+                    }
                     assert!(chooser.window.isVisible());
                     assert!(
                         chooser.window.accessibilityCloseButton().is_none(),
@@ -103,6 +179,26 @@ mod delegate {
                         let settings = state.settings.borrow();
                         let settings = settings.as_ref().unwrap();
                         assert!(settings.window.isVisible());
+                        assert_eq!(settings.auto_open.state(), NSControlStateValueOff);
+                        assert!(settings.timeout_details.isHidden());
+                        if let Some(browser) = state.app.settings_browser(0) {
+                            let exclusions: Vec<_> = browsers::exclusions().into_iter().collect();
+                            timeout_preferences(true, &browser.id, &exclusions);
+                            delegate.update_timeout_settings();
+                            assert_eq!(settings.auto_open.state(), NSControlStateValueOn);
+                            assert!(!settings.timeout_details.isHidden());
+                            let content = settings.window.contentView().unwrap();
+                            content.layoutSubtreeIfNeeded();
+                            let field = settings.timeout_seconds.convertRect_toView(
+                                settings.timeout_seconds.bounds(),
+                                Some(&content),
+                            );
+                            assert!(field.size.width >= 69.0);
+                            assert!(field.origin.x >= 0.0 && field.origin.y >= 0.0);
+                            snapshot(&content, ns_string!("target/native-timeout-settings.png"));
+                            timeout_preferences(false, "", &exclusions);
+                            delegate.update_timeout_settings();
+                        }
                         assert!(settings.window.accessibilityCloseButton().is_some());
                         assert!(!settings.window.isReleasedWhenClosed());
                         assert!(settings.window.contentViewController().is_some());

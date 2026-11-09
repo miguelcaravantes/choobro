@@ -17,6 +17,7 @@ pub struct App {
     settings_browsers: RefCell<Vec<Browser>>,
     configuring: Cell<bool>,
     default_failed: Cell<bool>,
+    timeout_unclaimed: Cell<bool>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -45,7 +46,10 @@ impl App {
         match requests.push(urls) {
             Err(reason) => Incoming::Rejected(reason),
             Ok(()) if pending => Incoming::Queued,
-            Ok(()) => Incoming::Show,
+            Ok(()) => {
+                self.timeout_unclaimed.set(true);
+                Incoming::Show
+            }
         }
     }
 
@@ -166,11 +170,30 @@ impl App {
             .then_some(destination)
     }
 
+    pub fn claim_timeout(&self) -> bool {
+        self.has_pending() && !self.busy() && self.timeout_unclaimed.replace(false)
+    }
+
+    pub fn cancel_timeout(&self) {
+        self.timeout_unclaimed.set(false);
+    }
+
+    pub fn timeout_browser(&self, id: &str) -> Option<usize> {
+        self.browsers
+            .borrow()
+            .iter()
+            .position(|browser| browser.id == id)
+    }
+
     pub fn cancel(&self) {
-        self.requests.borrow_mut().cancel();
+        if !self.busy() {
+            self.requests.borrow_mut().cancel();
+            self.timeout_unclaimed.set(self.has_pending());
+        }
     }
 
     pub fn begin_dispatch(&self) -> Option<Retained<NSArray<NSURL>>> {
+        self.cancel_timeout();
         self.requests.borrow_mut().begin()
     }
 
@@ -189,7 +212,9 @@ impl App {
 
     pub fn dispatch_finished(&self, success: bool) -> bool {
         self.requests.borrow_mut().finish(success);
-        success && self.has_pending()
+        let next = success && self.has_pending();
+        self.timeout_unclaimed.set(next);
+        next
     }
 
     pub fn configuring(&self) -> bool {
@@ -280,6 +305,29 @@ mod tests {
         assert_eq!(app.preview().unwrap().to_string(), "https://first.example");
         app.cancel();
         assert_eq!(app.receive(&urls("https://second.example")), Incoming::Show);
+    }
+
+    #[test]
+    fn timeout_is_once_per_request_and_never_restarts_after_interaction_or_failure() {
+        let app = App::default();
+        assert!(!app.claim_timeout());
+        app.receive(&urls("https://first.example"));
+        assert!(app.claim_timeout());
+        app.receive(&urls("https://second.example"));
+        assert!(!app.claim_timeout());
+        app.cancel_timeout();
+        assert!(!app.claim_timeout());
+        app.begin_dispatch();
+        app.dispatch_finished(false);
+        assert!(!app.claim_timeout());
+        app.begin_dispatch();
+        app.dispatch_finished(true);
+        assert!(app.claim_timeout());
+        app.cancel();
+        assert!(!app.claim_timeout());
+        app.receive(&urls("https://third.example"));
+        app.cancel_timeout();
+        assert!(!app.claim_timeout());
     }
 
     #[test]

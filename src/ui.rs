@@ -35,6 +35,11 @@ pub struct Settings {
     pub move_up: Retained<NSButton>,
     pub move_down: Retained<NSButton>,
     hint: Retained<NSTextField>,
+    pub auto_open: Retained<NSButton>,
+    pub timeout_seconds: Retained<NSTextField>,
+    pub timeout_browser: Retained<NSPopUpButton>,
+    pub timeout_details: Retained<NSStackView>,
+    pub timeout_error: Retained<NSTextField>,
 }
 
 impl Chooser {
@@ -133,6 +138,60 @@ impl Settings {
         self.hint
             .setHidden(!manual && self.table.numberOfRows() > 0);
         self.update_move_buttons();
+    }
+
+    pub fn update_timeout(&self, browsers: &[Browser]) {
+        let preference = crate::browsers::AutoOpen::load();
+        self.timeout_error.setHidden(true);
+        self.auto_open.setState(if preference.enabled {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        self.timeout_seconds
+            .setStringValue(&NSString::from_str(&preference.seconds.to_string()));
+        self.timeout_browser.removeAllItems();
+        self.timeout_browser
+            .addItemWithTitle(ns_string!("Choose a browser…"));
+        let excluded = crate::browsers::exclusions();
+        let mut selected = 0;
+        let mut listed = std::collections::BTreeSet::new();
+        for browser in browsers
+            .iter()
+            .filter(|browser| !excluded.contains(&browser.id))
+        {
+            if !listed.insert(&browser.id) {
+                continue;
+            }
+            let title = if browsers
+                .iter()
+                .any(|other| other.name == browser.name && other.id != browser.id)
+            {
+                format!("{} ({})", browser.name, browser.id)
+            } else {
+                browser.name.clone()
+            };
+            self.timeout_browser
+                .addItemWithTitle(&NSString::from_str(&title));
+            let index = self.timeout_browser.numberOfItems() - 1;
+            if let Some(item) = self.timeout_browser.itemAtIndex(index) {
+                unsafe {
+                    item.setRepresentedObject(Some(&NSString::from_str(&browser.id)));
+                }
+                item.setToolTip(Some(&NSString::from_str(&browser.path)));
+            }
+            if browser.id == preference.browser_id {
+                selected = index;
+            }
+        }
+        if selected == 0 && !preference.browser_id.is_empty() {
+            self.timeout_browser
+                .itemAtIndex(0)
+                .unwrap()
+                .setTitle(ns_string!("Saved browser unavailable"));
+        }
+        self.timeout_browser.selectItemAtIndex(selected);
+        self.timeout_details.setHidden(!preference.enabled);
     }
 
     pub fn update_move_buttons(&self) {
@@ -557,6 +616,57 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     )));
     root.addArrangedSubview(&hint);
     fill_width(&hint, &root);
+    let auto_open = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Automatically open a browser after waiting"),
+            Some(target),
+            Some(sel!(changeTimeout:)),
+            mtm,
+        )
+    };
+    root.addArrangedSubview(&auto_open);
+    let timeout_details = stack(mtm, true);
+    timeout_details.setSpacing(6.0);
+    let timeout_row = stack(mtm, false);
+    timeout_row.addArrangedSubview(&label("After", mtm));
+    let timeout_seconds = NSTextField::new(mtm);
+    timeout_seconds.setAccessibilityLabel(Some(ns_string!("Auto-open delay in seconds")));
+    timeout_seconds
+        .widthAnchor()
+        .constraintEqualToConstant(70.0)
+        .setActive(true);
+    let timeout_browser = NSPopUpButton::new(mtm);
+    timeout_browser.setAccessibilityLabel(Some(ns_string!("Auto-open browser")));
+    unsafe {
+        timeout_seconds.setTarget(Some(target));
+        timeout_seconds.setAction(Some(sel!(changeTimeout:)));
+        timeout_seconds.setDelegate(Some(ProtocolObject::from_ref(target)));
+        timeout_browser.setTarget(Some(target));
+        timeout_browser.setAction(Some(sel!(changeTimeout:)));
+    }
+    timeout_row.addArrangedSubview(&timeout_seconds);
+    timeout_row.addArrangedSubview(&label("seconds, open in", mtm));
+    timeout_row.addArrangedSubview(&timeout_browser);
+    timeout_details.addArrangedSubview(&timeout_row);
+    let timeout_help = NSTextField::wrappingLabelWithString(
+        ns_string!(
+            "Optional. Keyboard or mouse interaction cancels automatic opening for that request. Only enabled browsers can be used."
+        ),
+        mtm,
+    );
+    timeout_help.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    timeout_help.setFont(Some(&NSFont::systemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
+    let timeout_error = label("Enter a number of seconds greater than zero.", mtm);
+    timeout_error.setTextColor(Some(&NSColor::systemRedColor()));
+    timeout_error.setHidden(true);
+    timeout_details.addArrangedSubview(&timeout_error);
+    timeout_details.addArrangedSubview(&timeout_help);
+    fill_width(&timeout_help, &timeout_details);
+    root.addArrangedSubview(&timeout_details);
+    fill_width(&timeout_details, &root);
+    timeout_details.setHidden(true);
     let divider = NSBox::new(mtm);
     divider.setBoxType(NSBoxType::Separator);
     root.addArrangedSubview(&divider);
@@ -610,6 +720,11 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         move_up,
         move_down,
         hint,
+        auto_open,
+        timeout_seconds,
+        timeout_browser,
+        timeout_details,
+        timeout_error,
     }
 }
 

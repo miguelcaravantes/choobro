@@ -25,7 +25,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std", "block2", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSError", "NSGeometry",
-    "NSIndexSet", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSRange", "NSString", "NSURL",
+    "NSDate", "NSTimer", "NSIndexSet", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSRange", "NSString", "NSURL",
     "NSUserDefaults", "NSValue",
 ] }
 

@@ -10,7 +10,7 @@ use objc2::{
 use objc2_app_kit::*;
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSObject, NSObjectProtocol,
-    NSOperationQueue, NSString, NSURL, ns_string,
+    NSOperationQueue, NSString, NSTimer, NSURL, ns_string,
 };
 
 use crate::{
@@ -33,6 +33,10 @@ pub struct State {
     status_item: OnceCell<Retained<NSStatusItem>>,
     rejected_request: Cell<Option<Rejection>>,
     showing_rejection: Cell<bool>,
+    timeout: RefCell<Option<Retained<NSTimer>>>,
+    timeout_monitor: RefCell<Option<Retained<AnyObject>>>,
+    updating_chooser: Cell<bool>,
+    timeout_browser: RefCell<Option<String>>,
 }
 
 define_class!(
@@ -78,6 +82,7 @@ define_class!(
 
         #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
         fn reopen(&self, _application: &NSApplication, _visible: bool) -> bool {
+            self.cancel_timeout();
             if self.ivars().app.has_pending() {
                 self.refresh_chooser(true);
             } else {
@@ -88,6 +93,7 @@ define_class!(
 
         #[unsafe(method(applicationShouldTerminate:))]
         fn should_terminate(&self, _sender: &NSApplication) -> NSApplicationTerminateReply {
+            self.cancel_timeout();
             if self.ivars().app.has_pending() && !ui::confirm_quit(self.mtm()) {
                 return NSApplicationTerminateReply::TerminateCancel;
             }
@@ -137,7 +143,14 @@ define_class!(
         }
     }
 
-    unsafe impl NSControlTextEditingDelegate for Delegate {}
+    unsafe impl NSControlTextEditingDelegate for Delegate {
+        #[unsafe(method(controlTextDidEndEditing:))]
+        fn text_editing_ended(&self, _notification: &NSNotification) {
+            self.save_timeout();
+        }
+    }
+
+    unsafe impl NSTextFieldDelegate for Delegate {}
 
     unsafe impl NSTableViewDelegate for Delegate {
         #[unsafe(method_id(tableView:viewForTableColumn:row:))]
@@ -159,6 +172,12 @@ define_class!(
 
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn selection_changed(&self, notification: &NSNotification) {
+            if !self.ivars().updating_chooser.get()
+                && notification.object().and_then(|object| object.downcast::<NSTableView>().ok())
+                    .is_some_and(|table| !is_settings_table(&table))
+            {
+                self.cancel_timeout();
+            }
             if notification.object().and_then(|object| object.downcast::<NSTableView>().ok())
                 .is_some_and(|table| is_settings_table(&table))
                 && let Some(settings) = &*self.ivars().settings.borrow()
@@ -169,6 +188,28 @@ define_class!(
     }
 
     impl Delegate {
+        #[unsafe(method(changeTimeout:))]
+        fn change_timeout(&self, _sender: Option<&AnyObject>) {
+            self.save_timeout();
+        }
+
+        #[unsafe(method(timeoutFired:))]
+        fn timeout_fired(&self, timer: &NSTimer) {
+            if !self.ivars().timeout.borrow().as_ref().is_some_and(|current| &**current == timer) {
+                return;
+            }
+            let id = self.ivars().timeout_browser.borrow().clone();
+            self.cancel_timeout();
+            let Some(chooser) = self.ivars().chooser.get() else { return };
+            if !chooser.window.isVisible() || self.ivars().app.busy() { return; }
+            let preference = browsers::AutoOpen::load();
+            if !preference.enabled || id.as_deref() != Some(&preference.browser_id)
+                || browsers::exclusions().contains(&preference.browser_id) { return; }
+            if let Some(index) = id.and_then(|id| self.ivars().app.timeout_browser(&id)) {
+                self.dispatch_browser(index);
+            }
+        }
+
         #[unsafe(method(copyLink:))]
         fn copy_link(&self, _sender: Option<&AnyObject>) {
             self.copy_link_to(&NSPasteboard::generalPasteboard());
@@ -176,6 +217,7 @@ define_class!(
 
         #[unsafe(method(showSettings:))]
         fn show_settings(&self, _sender: Option<&AnyObject>) {
+            self.cancel_timeout();
             let selected = self.settings_selection();
             self.refresh_settings(selected);
             self.refresh_chooser(false);
@@ -186,6 +228,7 @@ define_class!(
 
         #[unsafe(method(showChooser:))]
         fn show_chooser(&self, _sender: Option<&AnyObject>) {
+            self.cancel_timeout();
             if self.ivars().app.has_pending() {
                 self.refresh_chooser(true);
             } else {
@@ -221,6 +264,7 @@ define_class!(
 
         #[unsafe(method(cancelRequest:))]
         fn cancel_request(&self, _sender: Option<&AnyObject>) {
+            self.cancel_timeout();
             self.ivars().app.cancel();
             self.refresh_chooser(true);
         }
@@ -229,21 +273,7 @@ define_class!(
         fn open_browser(&self, _sender: Option<&AnyObject>) {
             let Some(chooser) = self.ivars().chooser.get() else { return };
             let Ok(index) = usize::try_from(chooser.table.selectedRow()) else { return };
-            match self.ivars().app.open(index) {
-                OpenRequest::None => {},
-                OpenRequest::Unavailable => {
-                    self.refresh_chooser(false);
-                    chooser.browser_unavailable();
-                },
-                OpenRequest::Ready(browser, urls) => {
-                    self.set_busy(true);
-                    let name = browser.name.clone();
-                    browsers::open(&browser, &urls, move |success| {
-                        let name = name.clone();
-                        on_main(move || with_delegate(|delegate| delegate.dispatch_finished(success, &name)));
-                    });
-                },
-            }
+            self.dispatch_browser(index);
         }
 
         #[unsafe(method(makeDefault:))]
@@ -270,6 +300,158 @@ define_class!(
 );
 
 impl Delegate {
+    fn save_timeout(&self) {
+        self.cancel_timeout();
+        {
+            let settings = self.ivars().settings.borrow();
+            let Some(settings) = settings.as_ref() else {
+                return;
+            };
+            let enabled = settings.auto_open.state() == NSControlStateValueOn;
+            let seconds = settings
+                .timeout_seconds
+                .stringValue()
+                .to_string()
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|seconds| browsers::valid_timeout(*seconds))
+                .or_else(|| (!enabled).then(|| browsers::AutoOpen::load().seconds));
+            let Some(seconds) = seconds else {
+                settings.timeout_error.setHidden(false);
+                return;
+            };
+            let browser_id = settings
+                .timeout_browser
+                .selectedItem()
+                .and_then(|item| item.representedObject())
+                .and_then(|object| object.downcast::<NSString>().ok())
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| browsers::AutoOpen::load().browser_id);
+            browsers::AutoOpen {
+                enabled,
+                seconds,
+                browser_id,
+            }
+            .save();
+        }
+        self.update_timeout_settings();
+    }
+
+    fn update_timeout_settings(&self) {
+        if let Some(settings) = &*self.ivars().settings.borrow() {
+            let browsers: Vec<_> = (0..self.ivars().app.settings_browser_count())
+                .filter_map(|index| self.ivars().app.settings_browser(index))
+                .collect();
+            settings.update_timeout(&browsers);
+        }
+    }
+
+    fn cancel_timeout(&self) {
+        self.ivars().app.cancel_timeout();
+        if let Some(timer) = self.ivars().timeout.borrow_mut().take() {
+            timer.invalidate();
+            if let Some(chooser) = self.ivars().chooser.get() {
+                chooser.message.setStringValue(ns_string!(
+                    "Automatic opening canceled. Choose a browser to open the link."
+                ));
+            }
+        }
+        if let Some(monitor) = self.ivars().timeout_monitor.borrow_mut().take() {
+            unsafe {
+                NSEvent::removeMonitor(&monitor);
+            }
+        }
+        self.ivars().timeout_browser.borrow_mut().take();
+    }
+
+    fn start_timeout(&self) {
+        if !self.ivars().app.claim_timeout() {
+            return;
+        }
+        let preference = browsers::AutoOpen::load();
+        if !preference.enabled
+            || self
+                .ivars()
+                .app
+                .timeout_browser(&preference.browser_id)
+                .is_none()
+        {
+            return;
+        }
+        let monitor = RcBlock::new(|event: std::ptr::NonNull<NSEvent>| {
+            let native_event = unsafe { event.as_ref() };
+            with_delegate(|delegate| {
+                if delegate.ivars().chooser.get().is_some_and(|chooser| {
+                    native_event.window(delegate.mtm()).as_deref() == Some(&*chooser.window)
+                }) {
+                    delegate.cancel_timeout();
+                }
+            });
+            event.as_ptr()
+        });
+        let token = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+                NSEventMask::KeyDown
+                    | NSEventMask::LeftMouseDown
+                    | NSEventMask::RightMouseDown
+                    | NSEventMask::OtherMouseDown
+                    | NSEventMask::ScrollWheel,
+                &monitor,
+            )
+        };
+        let Some(token) = token else { return };
+        self.ivars().timeout_monitor.replace(Some(token));
+        self.ivars()
+            .timeout_browser
+            .replace(Some(preference.browser_id.clone()));
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                preference.seconds,
+                self,
+                sel!(timeoutFired:),
+                None,
+                false,
+            )
+        };
+        self.ivars().timeout.replace(Some(timer));
+        if let Some(chooser) = self.ivars().chooser.get()
+            && let Some(browser) = self
+                .ivars()
+                .app
+                .timeout_browser(&preference.browser_id)
+                .and_then(|index| self.ivars().app.browser(index))
+        {
+            chooser.message.setStringValue(&NSString::from_str(&format!(
+                "Opens in {} after {} seconds. Interact to cancel automatic opening.",
+                browser.name, preference.seconds
+            )));
+        }
+    }
+
+    fn dispatch_browser(&self, index: usize) {
+        self.cancel_timeout();
+        match self.ivars().app.open(index) {
+            OpenRequest::None => {}
+            OpenRequest::Unavailable => {
+                self.refresh_chooser(false);
+                if let Some(chooser) = self.ivars().chooser.get() {
+                    chooser.browser_unavailable();
+                }
+            }
+            OpenRequest::Ready(browser, urls) => {
+                self.set_busy(true);
+                let name = browser.name.clone();
+                browsers::open(&browser, &urls, move |success| {
+                    let name = name.clone();
+                    on_main(move || {
+                        with_delegate(|delegate| delegate.dispatch_finished(success, &name))
+                    });
+                });
+            }
+        }
+    }
+
     fn browser_drag_item(
         &self,
         table: &NSTableView,
@@ -354,6 +536,7 @@ impl Delegate {
         if let Some(settings) = &*self.ivars().settings.borrow() {
             settings.update(selected_row, browsers::manual_order());
         }
+        self.update_timeout_settings();
     }
 
     fn refresh_default_status(&self) {
@@ -378,6 +561,7 @@ impl Delegate {
     }
 
     fn copy_link_to(&self, pasteboard: &NSPasteboard) {
+        self.cancel_timeout();
         let url = self.ivars().app.preview();
         let Some(url) = url else { return };
         if let Some(chooser) = self.ivars().chooser.get() {
@@ -386,6 +570,7 @@ impl Delegate {
     }
 
     fn rejected_link(&self, reason: Rejection) {
+        self.cancel_timeout();
         if self.ivars().showing_rejection.replace(true) {
             return;
         }
@@ -401,14 +586,22 @@ impl Delegate {
         if self.ivars().app.busy() {
             return;
         }
+        if !present {
+            self.cancel_timeout();
+        }
         let selected = usize::try_from(chooser.table.selectedRow()).ok();
         let content = self.ivars().app.refresh(selected);
+        self.ivars().updating_chooser.set(true);
         chooser.update(
             content.as_ref(),
             self.ivars().app.browser_count(),
             present,
             self.mtm(),
         );
+        self.ivars().updating_chooser.set(false);
+        if present && content.is_some() {
+            self.start_timeout();
+        }
     }
 
     fn set_busy(&self, busy: bool) {
