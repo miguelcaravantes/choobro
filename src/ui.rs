@@ -20,6 +20,7 @@ pub struct Chooser {
     pub table: Retained<NSTableView>,
     pub preview: Retained<NSTextField>,
     pub copy: Retained<NSButton>,
+    pub remember: Retained<NSButton>,
     pub message: Retained<NSTextField>,
     pub open: Retained<NSButton>,
     pub cancel: Retained<NSButton>,
@@ -27,6 +28,11 @@ pub struct Chooser {
 
 pub struct Settings {
     pub window: Retained<NSWindow>,
+    pub heading: Retained<NSTextField>,
+    pub refresh: Retained<NSButton>,
+    pub tabs: Retained<NSSegmentedControl>,
+    pub browsers_pane: Retained<NSStackView>,
+    pub rules_pane: Retained<NSStackView>,
     pub status: Retained<NSTextField>,
     pub default_warning: Retained<NSTextField>,
     pub make_default: Retained<NSButton>,
@@ -40,6 +46,12 @@ pub struct Settings {
     pub timeout_browser: Retained<NSPopUpButton>,
     pub timeout_details: Retained<NSStackView>,
     pub timeout_error: Retained<NSTextField>,
+    pub rules_table: Retained<NSTableView>,
+    pub rules_hint: Retained<NSTextField>,
+    pub rule_domain: Retained<NSTextField>,
+    pub rule_browser: Retained<NSPopUpButton>,
+    pub remove_rule: Retained<NSButton>,
+    pub rule_error: Retained<NSTextField>,
 }
 
 impl Chooser {
@@ -71,16 +83,31 @@ impl Chooser {
         content: Option<&ChooserContent>,
         browser_count: usize,
         show: bool,
+        reset_remember: bool,
         mtm: MainThreadMarker,
     ) {
         let Some(content) = content else {
             self.window.orderOut(None);
             self.preview.setStringValue(ns_string!(""));
             self.preview.setToolTip(None);
+            self.remember.setState(NSControlStateValueOff);
+            self.remember.setHidden(true);
             return;
         };
         self.preview.setStringValue(&content.preview);
         self.preview.setToolTip(Some(&content.preview));
+        if reset_remember {
+            self.remember.setState(NSControlStateValueOff);
+        }
+        if let Some(domain) = &content.domain {
+            let label = format!("Always open {domain} in this browser");
+            self.remember.setTitle(&NSString::from_str(&label));
+            self.remember.setToolTip(Some(&NSString::from_str(&label)));
+            self.remember.setHidden(false);
+        } else {
+            self.remember.setState(NSControlStateValueOff);
+            self.remember.setHidden(true);
+        }
         reload_table(&self.table);
         if browser_count > 0 {
             self.table.selectRowIndexes_byExtendingSelection(
@@ -106,6 +133,7 @@ impl Chooser {
 
     pub fn set_busy(&self, busy: bool, browser_count: usize) {
         self.copy.setEnabled(!busy);
+        self.remember.setEnabled(!busy && browser_count > 0);
         self.open.setEnabled(!busy && browser_count > 0);
         self.cancel.setEnabled(!busy);
         self.table.setEnabled(!busy);
@@ -118,6 +146,18 @@ impl Chooser {
 }
 
 impl Settings {
+    pub fn select_tab(&self, index: isize) {
+        self.tabs.setSelectedSegment(index);
+        self.heading.setStringValue(if index == 1 {
+            ns_string!("Domain Rules")
+        } else {
+            ns_string!("Browsers")
+        });
+        self.refresh.setHidden(index != 0);
+        self.browsers_pane.setHidden(index != 0);
+        self.rules_pane.setHidden(index != 1);
+    }
+
     pub fn update(&self, selected_row: usize, manual: bool) {
         self.sort.selectItemAtIndex(isize::from(manual));
         reload_table(&self.table);
@@ -140,6 +180,44 @@ impl Settings {
         self.update_move_buttons();
     }
 
+    pub fn update_rules(&self, browsers: &[Browser], selected_row: Option<usize>) {
+        reload_table(&self.rules_table);
+        let count = self.rules_table.numberOfRows();
+        if count > 0 {
+            let row = selected_row
+                .map(|r| (r as isize).min(count - 1))
+                .unwrap_or(0)
+                .max(0);
+            self.rules_table.selectRowIndexes_byExtendingSelection(
+                &NSIndexSet::indexSetWithIndex(row as usize),
+                false,
+            );
+            self.rules_table.scrollRowToVisible(row);
+        }
+        self.rules_hint.setHidden(count > 0);
+        self.update_rule_buttons();
+        let previous = self
+            .rule_browser
+            .selectedItem()
+            .and_then(|item| item.representedObject())
+            .and_then(|object| object.downcast::<NSString>().ok())
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        populate_browser_popup(
+            &self.rule_browser,
+            browsers,
+            &previous,
+            "Choose a browser…",
+            false,
+        );
+    }
+
+    pub fn update_rule_buttons(&self) {
+        let row = self.rules_table.selectedRow();
+        self.remove_rule
+            .setEnabled(row >= 0 && row < self.rules_table.numberOfRows());
+    }
+
     pub fn update_timeout(&self, browsers: &[Browser]) {
         let preference = crate::browsers::AutoOpen::load();
         self.timeout_error.setHidden(true);
@@ -150,47 +228,13 @@ impl Settings {
         });
         self.timeout_seconds
             .setStringValue(&NSString::from_str(&preference.seconds.to_string()));
-        self.timeout_browser.removeAllItems();
-        self.timeout_browser
-            .addItemWithTitle(ns_string!("Choose a browser…"));
-        let excluded = crate::browsers::exclusions();
-        let mut selected = 0;
-        let mut listed = std::collections::BTreeSet::new();
-        for browser in browsers
-            .iter()
-            .filter(|browser| !excluded.contains(&browser.id))
-        {
-            if !listed.insert(&browser.id) {
-                continue;
-            }
-            let title = if browsers
-                .iter()
-                .any(|other| other.name == browser.name && other.id != browser.id)
-            {
-                format!("{} ({})", browser.name, browser.id)
-            } else {
-                browser.name.clone()
-            };
-            self.timeout_browser
-                .addItemWithTitle(&NSString::from_str(&title));
-            let index = self.timeout_browser.numberOfItems() - 1;
-            if let Some(item) = self.timeout_browser.itemAtIndex(index) {
-                unsafe {
-                    item.setRepresentedObject(Some(&NSString::from_str(&browser.id)));
-                }
-                item.setToolTip(Some(&NSString::from_str(&browser.path)));
-            }
-            if browser.id == preference.browser_id {
-                selected = index;
-            }
-        }
-        if selected == 0 && !preference.browser_id.is_empty() {
-            self.timeout_browser
-                .itemAtIndex(0)
-                .unwrap()
-                .setTitle(ns_string!("Saved browser unavailable"));
-        }
-        self.timeout_browser.selectItemAtIndex(selected);
+        populate_browser_popup(
+            &self.timeout_browser,
+            browsers,
+            &preference.browser_id,
+            "Choose a browser…",
+            true,
+        );
         self.timeout_details.setHidden(!preference.enabled);
     }
 
@@ -223,6 +267,54 @@ pub fn confirm_quit(mtm: MainThreadMarker) -> bool {
 
 pub fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
     NSTextField::labelWithString(&NSString::from_str(text), mtm)
+}
+
+fn populate_browser_popup(
+    popup: &NSPopUpButton,
+    browsers: &[Browser],
+    preferred_id: &str,
+    placeholder: &str,
+    show_unavailable: bool,
+) {
+    popup.removeAllItems();
+    popup.addItemWithTitle(&NSString::from_str(placeholder));
+    let excluded = crate::browsers::exclusions();
+    let mut selected = 0;
+    let mut listed = std::collections::BTreeSet::new();
+    for browser in browsers
+        .iter()
+        .filter(|browser| !excluded.contains(&browser.id))
+    {
+        if !listed.insert(&browser.id) {
+            continue;
+        }
+        let title = if browsers
+            .iter()
+            .any(|other| other.name == browser.name && other.id != browser.id)
+        {
+            format!("{} ({})", browser.name, browser.id)
+        } else {
+            browser.name.clone()
+        };
+        popup.addItemWithTitle(&NSString::from_str(&title));
+        let index = popup.numberOfItems() - 1;
+        if let Some(item) = popup.itemAtIndex(index) {
+            unsafe {
+                item.setRepresentedObject(Some(&NSString::from_str(&browser.id)));
+            }
+            item.setToolTip(Some(&NSString::from_str(&browser.path)));
+        }
+        if browser.id == preferred_id {
+            selected = index;
+        }
+    }
+    if show_unavailable && selected == 0 && !preferred_id.is_empty() {
+        popup
+            .itemAtIndex(0)
+            .unwrap()
+            .setTitle(ns_string!("Saved browser unavailable"));
+    }
+    popup.selectItemAtIndex(selected);
 }
 
 fn reload_table(table: &NSTableView) {
@@ -258,6 +350,8 @@ enum ButtonAction {
     MakeDefault,
     MoveUp,
     MoveDown,
+    AddRule,
+    RemoveRule,
 }
 
 impl ButtonAction {
@@ -270,6 +364,8 @@ impl ButtonAction {
             Self::MakeDefault => sel!(makeDefault:),
             Self::MoveUp => sel!(moveBrowserUp:),
             Self::MoveDown => sel!(moveBrowserDown:),
+            Self::AddRule => sel!(addRule:),
+            Self::RemoveRule => sel!(removeRule:),
         }
     }
 }
@@ -379,6 +475,19 @@ pub fn chooser(target: &Delegate) -> Chooser {
         .constraintGreaterThanOrEqualToConstant(100.0)
         .setActive(true);
 
+    let remember = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Always open this domain in this browser"),
+            Some(target),
+            Some(sel!(toggleRemember:)),
+            mtm,
+        )
+    };
+    remember.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+    remember.setHidden(true);
+    root.addArrangedSubview(&remember);
+    fill_width(&remember, &root);
+
     let message = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
     message.setSelectable(false);
     message.setPreferredMaxLayoutWidth(432.0);
@@ -405,6 +514,7 @@ pub fn chooser(target: &Delegate) -> Chooser {
         table,
         preview,
         copy,
+        remember,
         message,
         open,
         cancel,
@@ -504,18 +614,112 @@ pub fn browser_toggle(
     Retained::into_super(cell)
 }
 
+pub fn rule_domain_cell(pattern: &str, table: &NSTableView) -> Retained<NSView> {
+    let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("ruleDomain"), None) }
+        .and_then(|view| view.downcast::<NSTableCellView>().ok())
+        .unwrap_or_else(|| {
+            let mtm = table.mtm();
+            let cell = NSTableCellView::new(mtm);
+            cell.setIdentifier(Some(ns_string!("ruleDomain")));
+            let text = label("", mtm);
+            text.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
+            text.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(&text);
+            unsafe {
+                cell.setTextField(Some(&text));
+            }
+            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                text.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&cell.leadingAnchor(), 8.0),
+                text.trailingAnchor()
+                    .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -8.0),
+                text.centerYAnchor()
+                    .constraintEqualToAnchor(&cell.centerYAnchor()),
+            ]));
+            cell
+        });
+    let value = NSString::from_str(pattern);
+    unsafe { cell.textField() }
+        .expect("rule domain cell text subview")
+        .setStringValue(&value);
+    cell.setToolTip(Some(&value));
+    Retained::into_super(cell)
+}
+
+pub fn rule_browser_cell(
+    browser: Option<&Browser>,
+    browser_id: &str,
+    excluded: bool,
+    table: &NSTableView,
+) -> Retained<NSView> {
+    if let Some(browser) = browser
+        && !excluded
+    {
+        return browser_cell(browser, table, 4.0);
+    }
+    let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("ruleStatus"), None) }
+        .and_then(|view| view.downcast::<NSTableCellView>().ok())
+        .unwrap_or_else(|| {
+            let mtm = table.mtm();
+            let cell = NSTableCellView::new(mtm);
+            cell.setIdentifier(Some(ns_string!("ruleStatus")));
+            let text = label("", mtm);
+            text.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+            text.setTextColor(Some(&NSColor::secondaryLabelColor()));
+            text.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(&text);
+            unsafe {
+                cell.setTextField(Some(&text));
+            }
+            NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+                text.leadingAnchor()
+                    .constraintEqualToAnchor_constant(&cell.leadingAnchor(), 4.0),
+                text.trailingAnchor()
+                    .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -8.0),
+                text.centerYAnchor()
+                    .constraintEqualToAnchor(&cell.centerYAnchor()),
+            ]));
+            cell
+        });
+    let text = match browser {
+        Some(browser) => format!("{} (hidden)", browser.name),
+        None => format!("Unavailable ({browser_id})"),
+    };
+    let value = NSString::from_str(&text);
+    unsafe { cell.textField() }
+        .expect("rule status cell text subview")
+        .setStringValue(&value);
+    cell.setToolTip(Some(&value));
+    Retained::into_super(cell)
+}
+
 pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     let mtm = target.mtm();
     let (window, root) = window("ChooBro Settings", 560.0, 620.0, target);
     let heading = label("Browsers", mtm);
     heading.setFont(Some(&NSFont::boldSystemFontOfSize(20.0)));
     let refresh = button("", ButtonAction::Settings, target);
+    let tabs = unsafe {
+        NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
+            &NSArray::from_slice(&[ns_string!("Browsers"), ns_string!("Rules")]),
+            NSSegmentSwitchTracking::SelectOne,
+            Some(target),
+            Some(sel!(changeSettingsTab:)),
+            mtm,
+        )
+    };
+    tabs.setSelectedSegment(0);
+    tabs.setAccessibilityLabel(Some(ns_string!("Settings sections")));
     let header = stack(mtm, false);
+    header.setSpacing(8.0);
     header.addArrangedSubview(&heading);
-    header.addArrangedSubview(&NSView::new(mtm));
     header.addArrangedSubview(&refresh);
+    header.addArrangedSubview(&NSView::new(mtm));
+    header.addArrangedSubview(&tabs);
     root.addArrangedSubview(&header);
     fill_width(&header, &root);
+
+    let browsers_pane = stack(mtm, true);
     let subtitle = label("Show in browser chooser:", mtm);
     subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
     let toolbar = stack(mtm, false);
@@ -533,8 +737,8 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         sort.setAction(Some(sel!(changeBrowserSort:)));
     }
     toolbar.addArrangedSubview(&sort);
-    root.addArrangedSubview(&toolbar);
-    fill_width(&toolbar, &root);
+    browsers_pane.addArrangedSubview(&toolbar);
+    fill_width(&toolbar, &browsers_pane);
 
     let table = NSTableView::new(mtm);
     table.setIdentifier(Some(ns_string!("settingsBrowsers")));
@@ -599,23 +803,23 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     moves.addArrangedSubview(&move_up);
     moves.addArrangedSubview(&move_down);
     list_area.addArrangedSubview(&moves);
-    root.addArrangedSubview(&list_area);
-    fill_width(&list_area, &root);
+    browsers_pane.addArrangedSubview(&list_area);
+    fill_width(&list_area, &browsers_pane);
     NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
         scroll
             .heightAnchor()
             .constraintEqualToAnchor(&list_area.heightAnchor()),
         scroll
             .heightAnchor()
-            .constraintGreaterThanOrEqualToConstant(320.0),
+            .constraintGreaterThanOrEqualToConstant(322.0),
     ]));
     let hint = label("", mtm);
     hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
     hint.setFont(Some(&NSFont::systemFontOfSize(
         NSFont::smallSystemFontSize(),
     )));
-    root.addArrangedSubview(&hint);
-    fill_width(&hint, &root);
+    browsers_pane.addArrangedSubview(&hint);
+    fill_width(&hint, &browsers_pane);
     let auto_open = unsafe {
         NSButton::checkboxWithTitle_target_action(
             ns_string!("Automatically open a browser after waiting"),
@@ -624,7 +828,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
             mtm,
         )
     };
-    root.addArrangedSubview(&auto_open);
+    browsers_pane.addArrangedSubview(&auto_open);
     let timeout_details = stack(mtm, true);
     timeout_details.setSpacing(6.0);
     let timeout_row = stack(mtm, false);
@@ -664,9 +868,118 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     timeout_details.addArrangedSubview(&timeout_error);
     timeout_details.addArrangedSubview(&timeout_help);
     fill_width(&timeout_help, &timeout_details);
-    root.addArrangedSubview(&timeout_details);
-    fill_width(&timeout_details, &root);
+    browsers_pane.addArrangedSubview(&timeout_details);
+    fill_width(&timeout_details, &browsers_pane);
     timeout_details.setHidden(true);
+    root.addArrangedSubview(&browsers_pane);
+    fill_width(&browsers_pane, &root);
+
+    let rules_pane = stack(mtm, true);
+    let rules_subtitle = NSTextField::wrappingLabelWithString(
+        ns_string!(
+            "Links matching a saved domain open directly in its assigned browser without showing the chooser."
+        ),
+        mtm,
+    );
+    rules_subtitle.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    rules_pane.addArrangedSubview(&rules_subtitle);
+    fill_width(&rules_subtitle, &rules_pane);
+
+    let add_row = stack(mtm, false);
+    let rule_domain = NSTextField::new(mtm);
+    rule_domain.setPlaceholderString(Some(ns_string!("example.com or *.example.com")));
+    rule_domain.setAccessibilityLabel(Some(ns_string!("Domain")));
+    unsafe {
+        rule_domain.setTarget(Some(target));
+        rule_domain.setAction(Some(sel!(addRule:)));
+    }
+    let rule_browser = NSPopUpButton::new(mtm);
+    rule_browser.setAccessibilityLabel(Some(ns_string!("Browser for domain")));
+    let add_rule = button("Add Rule", ButtonAction::AddRule, target);
+    add_row.addArrangedSubview(&rule_domain);
+    add_row.addArrangedSubview(&rule_browser);
+    add_row.addArrangedSubview(&add_rule);
+    rules_pane.addArrangedSubview(&add_row);
+    fill_width(&add_row, &rules_pane);
+    rule_domain
+        .widthAnchor()
+        .constraintGreaterThanOrEqualToConstant(200.0)
+        .setActive(true);
+
+    let rule_error = label(
+        "Enter a valid domain (like example.com or *.example.com) and choose an enabled browser.",
+        mtm,
+    );
+    rule_error.setTextColor(Some(&NSColor::systemRedColor()));
+    rule_error.setHidden(true);
+    rules_pane.addArrangedSubview(&rule_error);
+    fill_width(&rule_error, &rules_pane);
+
+    let rules_table = NSTableView::new(mtm);
+    rules_table.setIdentifier(Some(ns_string!("settingsRules")));
+    let domain_col =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("ruleDomain"));
+    domain_col.setTitle(ns_string!("Domain"));
+    domain_col.setWidth(240.0);
+    domain_col.setMinWidth(140.0);
+    let browser_col =
+        NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("ruleBrowser"));
+    browser_col.setTitle(ns_string!("Browser"));
+    browser_col.setWidth(240.0);
+    browser_col.setMinWidth(140.0);
+    rules_table.addTableColumn(&domain_col);
+    rules_table.addTableColumn(&browser_col);
+    rules_table.setHeaderView(None);
+    rules_table.setStyle(NSTableViewStyle::Inset);
+    rules_table.setRowHeight(40.0);
+    rules_table.setAllowsEmptySelection(true);
+    rules_table.setAllowsMultipleSelection(false);
+    rules_table.setColumnAutoresizingStyle(
+        NSTableViewColumnAutoresizingStyle::LastColumnOnlyAutoresizingStyle,
+    );
+    rules_table.setAccessibilityLabel(Some(ns_string!("Saved domain rules")));
+    unsafe {
+        rules_table.setDataSource(Some(ProtocolObject::from_ref(target)));
+        rules_table.setDelegate(Some(ProtocolObject::from_ref(target)));
+    }
+    let rules_scroll = NSScrollView::new(mtm);
+    rules_scroll.setDocumentView(Some(&rules_table));
+    rules_scroll.setHasVerticalScroller(true);
+    rules_scroll.setAutohidesScrollers(true);
+    rules_scroll.setBorderType(NSBorderType::BezelBorder);
+    let rules_list_area = stack(mtm, false);
+    rules_list_area.setAlignment(NSLayoutAttribute::Top);
+    rules_list_area.addArrangedSubview(&rules_scroll);
+    rules_pane.addArrangedSubview(&rules_list_area);
+    fill_width(&rules_list_area, &rules_pane);
+    NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
+        rules_scroll
+            .heightAnchor()
+            .constraintEqualToAnchor(&rules_list_area.heightAnchor()),
+        rules_scroll
+            .heightAnchor()
+            .constraintGreaterThanOrEqualToConstant(220.0),
+    ]));
+
+    let rules_footer = stack(mtm, false);
+    let rules_hint = label(
+        "No domain rules yet. Add one above or from the chooser.",
+        mtm,
+    );
+    rules_hint.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    rules_hint.setFont(Some(&NSFont::systemFontOfSize(
+        NSFont::smallSystemFontSize(),
+    )));
+    let remove_rule = button("Remove Selected", ButtonAction::RemoveRule, target);
+    remove_rule.setEnabled(false);
+    rules_footer.addArrangedSubview(&rules_hint);
+    rules_footer.addArrangedSubview(&NSView::new(mtm));
+    rules_footer.addArrangedSubview(&remove_rule);
+    rules_pane.addArrangedSubview(&rules_footer);
+    fill_width(&rules_footer, &rules_pane);
+    root.addArrangedSubview(&rules_pane);
+    fill_width(&rules_pane, &root);
+
     let divider = NSBox::new(mtm);
     divider.setBoxType(NSBoxType::Separator);
     root.addArrangedSubview(&divider);
@@ -712,6 +1025,11 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     fill_width(&default_section, &root);
     Settings {
         window,
+        heading,
+        refresh,
+        tabs,
+        browsers_pane,
+        rules_pane,
         status,
         default_warning,
         make_default,
@@ -725,6 +1043,12 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         timeout_browser,
         timeout_details,
         timeout_error,
+        rules_table,
+        rules_hint,
+        rule_domain,
+        rule_browser,
+        remove_rule,
+        rule_error,
     }
 }
 

@@ -118,6 +118,8 @@ define_class!(
         fn number_of_rows(&self, table: &NSTableView) -> NSInteger {
             if is_settings_table(table) {
                 self.ivars().app.settings_browser_count() as NSInteger
+            } else if is_rules_table(table) {
+                self.ivars().app.rule_count() as NSInteger
             } else {
                 self.ivars().app.browser_count() as NSInteger
             }
@@ -145,8 +147,13 @@ define_class!(
 
     unsafe impl NSControlTextEditingDelegate for Delegate {
         #[unsafe(method(controlTextDidEndEditing:))]
-        fn text_editing_ended(&self, _notification: &NSNotification) {
-            self.save_timeout();
+        fn text_editing_ended(&self, notification: &NSNotification) {
+            if let Some(settings) = &*self.ivars().settings.borrow()
+                && notification.object().and_then(|o| o.downcast::<NSTextField>().ok())
+                    .is_some_and(|field| *field == *settings.timeout_seconds)
+            {
+                self.save_timeout();
+            }
         }
     }
 
@@ -164,6 +171,17 @@ define_class!(
                     } else {
                         Some(ui::browser_cell(&browser, table, 0.0))
                     }
+                } else if is_rules_table(table) {
+                    let rule = self.ivars().app.rule(row)?;
+                    if column.is_some_and(|column| &*column.identifier() == ns_string!("ruleDomain")) {
+                        Some(ui::rule_domain_cell(&rule.pattern, table))
+                    } else {
+                        let browser = (0..self.ivars().app.settings_browser_count())
+                            .filter_map(|index| self.ivars().app.settings_browser(index))
+                            .find(|browser| browser.id == rule.browser_id);
+                        let excluded = browsers::exclusions().contains(&rule.browser_id);
+                        Some(ui::rule_browser_cell(browser.as_ref(), &rule.browser_id, excluded, table))
+                    }
                 } else {
                     self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, table, 8.0))
                 }
@@ -172,22 +190,46 @@ define_class!(
 
         #[unsafe(method(tableViewSelectionDidChange:))]
         fn selection_changed(&self, notification: &NSNotification) {
-            if !self.ivars().updating_chooser.get()
-                && notification.object().and_then(|object| object.downcast::<NSTableView>().ok())
-                    .is_some_and(|table| !is_settings_table(&table))
-            {
+            let Some(table) = notification.object().and_then(|object| object.downcast::<NSTableView>().ok()) else {
+                return;
+            };
+            if is_settings_table(&table) {
+                if let Some(settings) = &*self.ivars().settings.borrow() {
+                    settings.update_move_buttons();
+                }
+            } else if is_rules_table(&table) {
+                if let Some(settings) = &*self.ivars().settings.borrow() {
+                    settings.update_rule_buttons();
+                }
+            } else if !self.ivars().updating_chooser.get() {
                 self.cancel_timeout();
-            }
-            if notification.object().and_then(|object| object.downcast::<NSTableView>().ok())
-                .is_some_and(|table| is_settings_table(&table))
-                && let Some(settings) = &*self.ivars().settings.borrow()
-            {
-                settings.update_move_buttons();
             }
         }
     }
 
     impl Delegate {
+        #[unsafe(method(changeSettingsTab:))]
+        fn change_settings_tab(&self, sender: &NSSegmentedControl) {
+            if let Some(settings) = &*self.ivars().settings.borrow() {
+                settings.select_tab(sender.selectedSegment());
+            }
+        }
+
+        #[unsafe(method(toggleRemember:))]
+        fn toggle_remember(&self, _sender: Option<&AnyObject>) {
+            self.cancel_timeout();
+        }
+
+        #[unsafe(method(addRule:))]
+        fn add_rule(&self, _sender: Option<&AnyObject>) {
+            self.save_rule_from_settings();
+        }
+
+        #[unsafe(method(removeRule:))]
+        fn remove_rule(&self, _sender: Option<&AnyObject>) {
+            self.remove_selected_rule();
+        }
+
         #[unsafe(method(changeTimeout:))]
         fn change_timeout(&self, _sender: Option<&AnyObject>) {
             self.save_timeout();
@@ -206,7 +248,7 @@ define_class!(
             if !preference.enabled || id.as_deref() != Some(&preference.browser_id)
                 || browsers::exclusions().contains(&preference.browser_id) { return; }
             if let Some(index) = id.and_then(|id| self.ivars().app.timeout_browser(&id)) {
-                self.dispatch_browser(index);
+                self.dispatch_browser(index, false);
             }
         }
 
@@ -273,7 +315,8 @@ define_class!(
         fn open_browser(&self, _sender: Option<&AnyObject>) {
             let Some(chooser) = self.ivars().chooser.get() else { return };
             let Ok(index) = usize::try_from(chooser.table.selectedRow()) else { return };
-            self.dispatch_browser(index);
+            let remember = !chooser.remember.isHidden() && chooser.remember.state() == NSControlStateValueOn;
+            self.dispatch_browser(index, remember);
         }
 
         #[unsafe(method(makeDefault:))]
@@ -429,8 +472,62 @@ impl Delegate {
         }
     }
 
-    fn dispatch_browser(&self, index: usize) {
+    fn save_rule_from_settings(&self) {
+        let index = {
+            let settings = self.ivars().settings.borrow();
+            let Some(settings) = settings.as_ref() else {
+                return;
+            };
+            let domain = settings.rule_domain.stringValue().to_string();
+            let browser_id = settings
+                .rule_browser
+                .selectedItem()
+                .and_then(|item| item.representedObject())
+                .and_then(|object| object.downcast::<NSString>().ok())
+                .map(|id| id.to_string())
+                .unwrap_or_default();
+            let Some(index) = self.ivars().app.save_domain_rule(&domain, &browser_id) else {
+                settings.rule_error.setHidden(false);
+                return;
+            };
+            settings.rule_error.setHidden(true);
+            settings.rule_domain.setStringValue(ns_string!(""));
+            index
+        };
+        self.update_rules_settings(Some(index));
+    }
+
+    fn remove_selected_rule(&self) {
+        let selected = self
+            .ivars()
+            .settings
+            .borrow()
+            .as_ref()
+            .and_then(|settings| usize::try_from(settings.rules_table.selectedRow()).ok());
+        let Some(index) = selected else {
+            return;
+        };
+        if let Some(next_selected) = self.ivars().app.remove_rule(index) {
+            self.update_rules_settings(Some(next_selected));
+        }
+    }
+
+    fn update_rules_settings(&self, selected_row: Option<usize>) {
+        if let Some(settings) = &*self.ivars().settings.borrow() {
+            let browsers: Vec<_> = (0..self.ivars().app.settings_browser_count())
+                .filter_map(|index| self.ivars().app.settings_browser(index))
+                .collect();
+            let selected =
+                selected_row.or_else(|| usize::try_from(settings.rules_table.selectedRow()).ok());
+            settings.update_rules(&browsers, selected);
+        }
+    }
+
+    fn dispatch_browser(&self, index: usize, remember: bool) {
         self.cancel_timeout();
+        let domain = remember
+            .then(|| self.ivars().app.current_domain())
+            .flatten();
         match self.ivars().app.open(index) {
             OpenRequest::None => {}
             OpenRequest::Unavailable => {
@@ -440,6 +537,12 @@ impl Delegate {
                 }
             }
             OpenRequest::Ready(browser, urls) => {
+                if let Some(domain) = domain
+                    && let Some(rule_index) =
+                        self.ivars().app.save_domain_rule(&domain, &browser.id)
+                {
+                    self.update_rules_settings(Some(rule_index));
+                }
                 self.set_busy(true);
                 let name = browser.name.clone();
                 browsers::open(&browser, &urls, move |success| {
@@ -526,6 +629,10 @@ impl Delegate {
         let selected_row = self.ivars().app.refresh_settings(selected);
         if self.ivars().settings.borrow().is_none() {
             let settings = ui::settings(self, self.ivars().app.configuring());
+            if let Some(content) = settings.window.contentView() {
+                content.layoutSubtreeIfNeeded();
+            }
+            settings.select_tab(0);
             self.ivars().settings.borrow_mut().replace(settings);
         }
         self.update_settings(selected_row);
@@ -537,6 +644,7 @@ impl Delegate {
             settings.update(selected_row, browsers::manual_order());
         }
         self.update_timeout_settings();
+        self.update_rules_settings(None);
     }
 
     fn refresh_default_status(&self) {
@@ -585,16 +693,27 @@ impl Delegate {
         };
         if self.ivars().app.busy() {
             return;
-        }
+        };
         if !present {
             self.cancel_timeout();
         }
         let selected = usize::try_from(chooser.table.selectedRow()).ok();
         let content = self.ivars().app.refresh(selected);
+        if present
+            && content.is_some()
+            && let Some(browser_id) = self.ivars().app.claim_route()
+            && let Some(index) = self.ivars().app.timeout_browser(&browser_id)
+        {
+            self.dispatch_browser(index, false);
+            if self.ivars().app.busy() {
+                return;
+            }
+        }
         self.ivars().updating_chooser.set(true);
         chooser.update(
             content.as_ref(),
             self.ivars().app.browser_count(),
+            present,
             present,
             self.mtm(),
         );
@@ -639,6 +758,10 @@ impl Delegate {
 
 fn is_settings_table(table: &NSTableView) -> bool {
     table.identifier().as_deref() == Some(ns_string!("settingsBrowsers"))
+}
+
+fn is_rules_table(table: &NSTableView) -> bool {
+    table.identifier().as_deref() == Some(ns_string!("settingsRules"))
 }
 
 fn with_delegate(f: impl FnOnce(&Delegate)) {

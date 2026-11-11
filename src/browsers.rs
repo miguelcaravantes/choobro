@@ -1,11 +1,236 @@
 use std::{collections::BTreeSet, path::Path};
 
 use block2::RcBlock;
-use objc2::rc::Retained;
+use objc2::{rc::Retained, runtime::AnyObject};
 use objc2_app_kit::{NSImage, NSRunningApplication, NSWorkspace, NSWorkspaceOpenConfiguration};
-use objc2_foundation::{NSArray, NSBundle, NSError, NSString, NSURL, NSUserDefaults, ns_string};
+use objc2_foundation::{
+    NSArray, NSBundle, NSDictionary, NSError, NSString, NSURL, NSUserDefaults, ns_string,
+};
 
 pub const BUNDLE_ID: &str = "io.github.miguelcaravantes.choobro";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatchKind {
+    Domain,
+}
+
+impl MatchKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "domain" => Some(Self::Domain),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub kind: MatchKind,
+    pub pattern: String,
+    pub browser_id: String,
+}
+
+impl Rule {
+    pub fn matches(&self, url: &NSURL) -> bool {
+        match self.kind {
+            MatchKind::Domain => url_domain(url).is_some_and(|domain| {
+                if let Some(suffix) = self.pattern.strip_prefix("*.") {
+                    domain == suffix
+                        || domain
+                            .strip_suffix(suffix)
+                            .is_some_and(|prefix| prefix.ends_with('.'))
+                } else {
+                    domain == self.pattern
+                }
+            }),
+        }
+    }
+}
+
+pub fn normalize_domain(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (wildcard, rest) = if let Some(after) = trimmed.strip_prefix("*.") {
+        (true, after)
+    } else {
+        (false, trimmed)
+    };
+    if rest.contains('*') {
+        return None;
+    }
+    let parsed_host = if rest.contains("://") {
+        if wildcard {
+            return None;
+        }
+        NSURL::URLWithString(&NSString::from_str(rest))
+            .and_then(|url| url.host())
+            .map(|host| host.to_string())?
+    } else {
+        let host_port = rest.split(['/', '?', '#']).next()?;
+        if let Some(bracketed) = host_port.strip_prefix('[') {
+            if wildcard {
+                return None;
+            }
+            let (ipv6, rem) = bracketed.split_once(']')?;
+            if !rem.is_empty() && !rem.starts_with(':') {
+                return None;
+            }
+            format!("[{ipv6}]")
+        } else if let Some((host, port)) = host_port.rsplit_once(':') {
+            if port.chars().all(|c| c.is_ascii_digit()) && !port.is_empty() {
+                host.to_owned()
+            } else {
+                return None;
+            }
+        } else {
+            host_port.to_owned()
+        }
+    };
+    let domain = parsed_host.trim_matches('.').to_ascii_lowercase();
+    if domain.is_empty()
+        || domain
+            .split('.')
+            .any(|label| label.is_empty() || label.starts_with('-') || label.ends_with('-'))
+        || domain
+            .chars()
+            .any(|c| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '@' | '\\' | '*'))
+    {
+        return None;
+    }
+    Some(if wildcard {
+        format!("*.{domain}")
+    } else {
+        domain
+    })
+}
+
+pub fn url_domain(url: &NSURL) -> Option<String> {
+    url.host()
+        .and_then(|host| normalize_domain(&host.to_string()))
+}
+
+pub fn shared_domain(urls: &NSArray<NSURL>) -> Option<String> {
+    let first = url_domain(&urls.objectAtIndex(0))?;
+    urls.iter()
+        .all(|url| url_domain(&url).as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+pub fn rules() -> Vec<Rule> {
+    rules_from_defaults(&NSUserDefaults::standardUserDefaults())
+}
+
+fn rules_from_defaults(defaults: &NSUserDefaults) -> Vec<Rule> {
+    let Some(items) = defaults.arrayForKey(ns_string!("RoutingRules")) else {
+        return Vec::new();
+    };
+    let mut loaded = Vec::new();
+    for item in items {
+        let Ok(dict) = item.downcast::<NSDictionary>() else {
+            continue;
+        };
+        let Some(kind) = dict
+            .objectForKey(ns_string!("kind"))
+            .and_then(|v| v.downcast::<NSString>().ok())
+            .and_then(|v| MatchKind::parse(&v.to_string()))
+        else {
+            continue;
+        };
+        let Some(pattern) = dict
+            .objectForKey(ns_string!("pattern"))
+            .and_then(|v| v.downcast::<NSString>().ok())
+            .and_then(|v| match kind {
+                MatchKind::Domain => normalize_domain(&v.to_string()),
+            })
+        else {
+            continue;
+        };
+        let Some(browser_id) = dict
+            .objectForKey(ns_string!("browser"))
+            .and_then(|v| v.downcast::<NSString>().ok())
+            .map(|v| v.to_string())
+            .filter(|v| !v.is_empty())
+        else {
+            continue;
+        };
+        if let Some(existing) = loaded
+            .iter_mut()
+            .find(|rule: &&mut Rule| rule.kind == kind && rule.pattern == pattern)
+        {
+            existing.browser_id = browser_id;
+        } else {
+            loaded.push(Rule {
+                kind,
+                pattern,
+                browser_id,
+            });
+        }
+    }
+    loaded
+}
+
+pub fn save_rules(rules: &[Rule]) {
+    save_rules_to_defaults(&NSUserDefaults::standardUserDefaults(), rules);
+}
+
+fn save_rules_to_defaults(defaults: &NSUserDefaults, rules: &[Rule]) {
+    let dicts: Vec<_> = rules
+        .iter()
+        .map(|rule| {
+            let kind = NSString::from_str(rule.kind.as_str());
+            let pattern = NSString::from_str(&rule.pattern);
+            let browser = NSString::from_str(&rule.browser_id);
+            NSDictionary::<NSString, AnyObject>::from_slices(
+                &[
+                    ns_string!("kind"),
+                    ns_string!("pattern"),
+                    ns_string!("browser"),
+                ],
+                &[&*kind, &*pattern, &*browser],
+            )
+        })
+        .collect();
+    let array = NSArray::from_retained_slice(&dicts);
+    unsafe {
+        defaults.setObject_forKey(Some(&array), ns_string!("RoutingRules"));
+    }
+}
+
+pub fn upsert_rule(rules: &mut Vec<Rule>, rule: Rule) {
+    if let Some(existing) = rules
+        .iter_mut()
+        .find(|existing| existing.kind == rule.kind && existing.pattern == rule.pattern)
+    {
+        existing.browser_id = rule.browser_id;
+    } else {
+        rules.push(rule);
+    }
+}
+
+pub fn matching_rule_browser(rules: &[Rule], urls: &NSArray<NSURL>) -> Option<String> {
+    if urls.is_empty() {
+        return None;
+    }
+    let match_url = |url: &NSURL| {
+        rules
+            .iter()
+            .find(|rule| !rule.pattern.starts_with("*.") && rule.matches(url))
+            .or_else(|| rules.iter().find(|rule| rule.matches(url)))
+    };
+    let first = urls.objectAtIndex(0);
+    let browser_id = match_url(&first)?.browser_id.clone();
+    urls.iter()
+        .all(|url| match_url(&url).is_some_and(|rule| rule.browser_id == browser_id))
+        .then_some(browser_id)
+}
 
 #[derive(Clone)]
 pub struct Browser {
@@ -321,6 +546,138 @@ mod tests {
             url: NSURL::fileURLWithPath(&NSString::from_str(path)),
             icon: NSImage::new(),
         }
+    }
+
+    #[test]
+    fn normalizes_domains_and_matches_exact_hosts() {
+        assert_eq!(normalize_domain("Example.COM"), Some("example.com".into()));
+        assert_eq!(
+            normalize_domain("*.Example.COM"),
+            Some("*.example.com".into())
+        );
+        assert_eq!(
+            normalize_domain("  https://WWW.Example.com:8080/path?q=1#top "),
+            Some("www.example.com".into())
+        );
+        assert_eq!(
+            normalize_domain("sub.example.com/some/path"),
+            Some("sub.example.com".into())
+        );
+        assert_eq!(normalize_domain("localhost:3000"), Some("localhost".into()));
+        assert_eq!(normalize_domain("[::1]:8000"), Some("[::1]".into()));
+        assert_eq!(normalize_domain("example.com."), Some("example.com".into()));
+        for invalid in [
+            "",
+            "   ",
+            "*",
+            "*.",
+            "**.example.com",
+            "a.*.example.com",
+            "-bad.example",
+            "bad-.example",
+            "a..b.example",
+            "bad host.example",
+        ] {
+            assert_eq!(normalize_domain(invalid), None, "{invalid}");
+        }
+        let exact = Rule {
+            kind: MatchKind::Domain,
+            pattern: "www.example.com".into(),
+            browser_id: "org.mozilla.firefox".into(),
+        };
+        let wildcard = Rule {
+            kind: MatchKind::Domain,
+            pattern: "*.example.com".into(),
+            browser_id: "com.apple.Safari".into(),
+        };
+        let www = NSURL::URLWithString(ns_string!("https://WWW.EXAMPLE.COM:443/hello")).unwrap();
+        let apex = NSURL::URLWithString(ns_string!("https://example.com/hello")).unwrap();
+        let deep = NSURL::URLWithString(ns_string!("https://a.b.example.com/hello")).unwrap();
+        let cousin = NSURL::URLWithString(ns_string!("https://badexample.com/hello")).unwrap();
+        assert!(exact.matches(&www));
+        assert!(!exact.matches(&apex));
+        assert!(wildcard.matches(&www));
+        assert!(wildcard.matches(&apex));
+        assert!(wildcard.matches(&deep));
+        assert!(!wildcard.matches(&cousin));
+        let rules = vec![wildcard, exact];
+        assert_eq!(
+            matching_rule_browser(&rules, &NSArray::from_retained_slice(&[www])),
+            Some("org.mozilla.firefox".into())
+        );
+        assert_eq!(
+            matching_rule_browser(&rules, &NSArray::from_retained_slice(&[apex])),
+            Some("com.apple.Safari".into())
+        );
+    }
+
+    #[test]
+    fn rules_round_trip_and_deduplicate_in_user_defaults() {
+        use objc2::AnyThread;
+        let defaults = NSUserDefaults::initWithSuiteName(
+            NSUserDefaults::alloc(),
+            Some(ns_string!("io.github.miguelcaravantes.choobro.rules-tests")),
+        )
+        .unwrap();
+        defaults.removeObjectForKey(ns_string!("RoutingRules"));
+        let mut list = Vec::new();
+        upsert_rule(
+            &mut list,
+            Rule {
+                kind: MatchKind::Domain,
+                pattern: "example.com".into(),
+                browser_id: "com.google.Chrome".into(),
+            },
+        );
+        upsert_rule(
+            &mut list,
+            Rule {
+                kind: MatchKind::Domain,
+                pattern: "www.example.com".into(),
+                browser_id: "org.mozilla.firefox".into(),
+            },
+        );
+        upsert_rule(
+            &mut list,
+            Rule {
+                kind: MatchKind::Domain,
+                pattern: "example.com".into(),
+                browser_id: "com.apple.Safari".into(),
+            },
+        );
+        save_rules_to_defaults(&defaults, &list);
+        let loaded = rules_from_defaults(&defaults);
+        assert_eq!(
+            loaded,
+            vec![
+                Rule {
+                    kind: MatchKind::Domain,
+                    pattern: "example.com".into(),
+                    browser_id: "com.apple.Safari".into(),
+                },
+                Rule {
+                    kind: MatchKind::Domain,
+                    pattern: "www.example.com".into(),
+                    browser_id: "org.mozilla.firefox".into(),
+                },
+            ]
+        );
+        let single = NSArray::from_retained_slice(&[NSURL::URLWithString(ns_string!(
+            "https://example.com/search?q=rust"
+        ))
+        .unwrap()]);
+        assert_eq!(
+            matching_rule_browser(&loaded, &single),
+            Some("com.apple.Safari".into())
+        );
+        let mixed = NSArray::from_retained_slice(&[
+            NSURL::URLWithString(ns_string!("https://example.com/a")).unwrap(),
+            NSURL::URLWithString(ns_string!("https://www.example.com/b")).unwrap(),
+        ]);
+        assert_eq!(matching_rule_browser(&loaded, &mixed), None);
+        assert_eq!(shared_domain(&single), Some("example.com".into()));
+        assert_eq!(shared_domain(&mixed), None);
+        defaults.removeObjectForKey(ns_string!("RoutingRules"));
     }
 
     #[test]

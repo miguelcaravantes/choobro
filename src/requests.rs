@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
-use objc2::rc::Retained;
-use objc2_foundation::{NSArray, NSCopying, NSURL, NSUTF8StringEncoding};
+use objc2::{Message, rc::Retained};
+use objc2_foundation::{NSArray, NSURL, NSURLComponents, NSUTF8StringEncoding};
 
 const MAX_PENDING_URLS: usize = 256;
 const MAX_PENDING_URL_BYTES: usize = 8 * 1024 * 1024;
@@ -38,6 +38,46 @@ pub fn is_web_url(url: &NSURL) -> bool {
         && url.host().is_some_and(|host| !host.is_empty())
 }
 
+pub fn unwrap_url(url: &NSURL) -> Retained<NSURL> {
+    let mut current = url.retain();
+    for _ in 0..4 {
+        let Some(inner) = wrapped_target(&current) else {
+            break;
+        };
+        current = inner;
+    }
+    current
+}
+
+fn wrapped_target(url: &NSURL) -> Option<Retained<NSURL>> {
+    if !is_safelink_wrapper(url) {
+        return None;
+    }
+    let components = NSURLComponents::componentsWithURL_resolvingAgainstBaseURL(url, false)?;
+    let items = components.queryItems()?;
+    let target = items.iter().find_map(|item| {
+        (item.name().to_string().eq_ignore_ascii_case("url"))
+            .then(|| item.value())
+            .flatten()
+    })?;
+    let candidate = NSURL::URLWithString(&target)?;
+    is_web_url(&candidate).then_some(candidate)
+}
+
+fn is_safelink_wrapper(url: &NSURL) -> bool {
+    let Some(host) = url.host().map(|h| h.to_string().to_ascii_lowercase()) else {
+        return false;
+    };
+    let path = url
+        .path()
+        .map(|p| p.to_string().to_ascii_lowercase())
+        .unwrap_or_default();
+    host.ends_with(".safelinks.protection.outlook.com")
+        || host == "safelinks.protection.outlook.com"
+        || ((host == "teams.public.onecdn.static.microsoft" || host.ends_with(".microsoft.com"))
+            && path.contains("/safelinks/"))
+}
+
 #[derive(Default)]
 pub struct Requests {
     pending: VecDeque<Pending>,
@@ -59,9 +99,13 @@ impl Requests {
         if urls.len() > MAX_PENDING_URLS - self.pending_urls {
             return Err(Rejection::Full);
         }
-        let urls = urls.copy();
+        let mut resolved = Vec::with_capacity(urls.len());
         let mut bytes = 0;
-        for url in &*urls {
+        for url in urls {
+            if !is_web_url(&url) {
+                return Err(Rejection::Unsupported);
+            }
+            let url = unwrap_url(&url);
             let value = url.absoluteString().ok_or(Rejection::Unsupported)?;
             let remaining = MAX_PENDING_URL_BYTES - self.pending_bytes - bytes;
             if value.len() > remaining {
@@ -71,11 +115,10 @@ impl Requests {
             if length > remaining {
                 return Err(Rejection::Full);
             }
-            if !is_web_url(&url) {
-                return Err(Rejection::Unsupported);
-            }
             bytes += length;
+            resolved.push(url);
         }
+        let urls = NSArray::from_retained_slice(&resolved);
         self.pending_urls += urls.len();
         self.pending_bytes += bytes;
         self.pending.push_back(Pending { urls, bytes });
@@ -146,6 +189,31 @@ mod tests {
         ] {
             assert!(!is_web_url(&urls(value).objectAtIndex(0)), "{value}");
         }
+    }
+
+    #[test]
+    fn unwraps_teams_and_outlook_safelinks_to_original_destination() {
+        let teams = "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=https%3A%2F%2Fwww.example.com%2Finbox%3Fq%3D1%26b%3D2&locale=en-us&dest=https%3A%2F%2Fteams.microsoft.com%2F";
+        let mut requests = Requests::default();
+        requests.push(&urls(teams)).unwrap();
+        assert_eq!(
+            requests
+                .current()
+                .unwrap()
+                .objectAtIndex(0)
+                .absoluteString()
+                .unwrap()
+                .to_string(),
+            "https://www.example.com/inbox?q=1&b=2"
+        );
+        let evil = "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=file%3A%2F%2F%2Fetc%2Fpasswd";
+        assert_eq!(
+            unwrap_url(&urls(evil).objectAtIndex(0))
+                .absoluteString()
+                .unwrap()
+                .to_string(),
+            evil
+        );
     }
 
     #[test]

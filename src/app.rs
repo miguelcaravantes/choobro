@@ -15,9 +15,12 @@ pub struct App {
     requests: RefCell<Requests>,
     browsers: RefCell<Vec<Browser>>,
     settings_browsers: RefCell<Vec<Browser>>,
+    rules: RefCell<Vec<browsers::Rule>>,
+    rules_loaded: Cell<bool>,
     configuring: Cell<bool>,
     default_failed: Cell<bool>,
     timeout_unclaimed: Cell<bool>,
+    route_unclaimed: Cell<bool>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -35,6 +38,7 @@ pub enum OpenRequest {
 
 pub struct ChooserContent {
     pub preview: Retained<NSString>,
+    pub domain: Option<String>,
     pub selected_row: usize,
     pub count: usize,
 }
@@ -48,6 +52,7 @@ impl App {
             Ok(()) if pending => Incoming::Queued,
             Ok(()) => {
                 self.timeout_unclaimed.set(true);
+                self.route_unclaimed.set(true);
                 Incoming::Show
             }
         }
@@ -76,8 +81,29 @@ impl App {
         self.browsers.borrow().get(index).cloned()
     }
 
+    pub fn current_domain(&self) -> Option<String> {
+        let requests = self.requests.borrow();
+        browsers::shared_domain(requests.current()?)
+    }
+
+    pub fn claim_route(&self) -> Option<String> {
+        if !self.has_pending() || self.busy() || !self.route_unclaimed.replace(false) {
+            return None;
+        }
+        let requests = self.requests.borrow();
+        let urls = requests.current()?;
+        let rules = browsers::rules();
+        let browser_id = browsers::matching_rule_browser(&rules, urls)?;
+        *self.rules.borrow_mut() = rules;
+        self.rules_loaded.set(true);
+        if browsers::exclusions().contains(&browser_id) {
+            return None;
+        }
+        Some(browser_id)
+    }
+
     pub fn refresh(&self, selected: Option<usize>) -> Option<ChooserContent> {
-        let (schemes, preview, count) = {
+        let (schemes, preview, domain, count) = {
             let requests = self.requests.borrow();
             let urls = requests.current()?;
             let schemes = urls
@@ -92,6 +118,7 @@ impl App {
                 urls.objectAtIndex(0)
                     .absoluteString()
                     .unwrap_or_else(|| ns_string!("Web link").into()),
+                browsers::shared_domain(urls),
                 urls.len(),
             )
         };
@@ -110,6 +137,7 @@ impl App {
         *self.browsers.borrow_mut() = browsers;
         Some(ChooserContent {
             preview,
+            domain,
             selected_row,
             count,
         })
@@ -133,7 +161,53 @@ impl App {
             .position(|browser| Some(&browser.path) == selected_path.as_ref())
             .unwrap_or(0);
         *self.settings_browsers.borrow_mut() = browsers;
+        *self.rules.borrow_mut() = browsers::rules();
+        self.rules_loaded.set(true);
         selected_row
+    }
+
+    pub fn rule_count(&self) -> usize {
+        self.rules.borrow().len()
+    }
+
+    pub fn rule(&self, index: usize) -> Option<browsers::Rule> {
+        self.rules.borrow().get(index).cloned()
+    }
+
+    pub fn save_domain_rule(&self, domain: &str, browser_id: &str) -> Option<usize> {
+        let pattern = browsers::normalize_domain(domain)?;
+        if browser_id.is_empty() {
+            return None;
+        }
+        if !self.rules_loaded.replace(true) {
+            *self.rules.borrow_mut() = browsers::rules();
+        }
+        let mut rules = self.rules.borrow_mut();
+        browsers::upsert_rule(
+            &mut rules,
+            browsers::Rule {
+                kind: browsers::MatchKind::Domain,
+                pattern: pattern.clone(),
+                browser_id: browser_id.to_owned(),
+            },
+        );
+        let index = rules
+            .iter()
+            .position(|rule| rule.pattern == pattern)
+            .unwrap_or(0);
+        browsers::save_rules(&rules);
+        Some(index)
+    }
+
+    pub fn remove_rule(&self, index: usize) -> Option<usize> {
+        let mut rules = self.rules.borrow_mut();
+        if index >= rules.len() {
+            return None;
+        }
+        rules.remove(index);
+        let selected = index.min(rules.len().saturating_sub(1));
+        browsers::save_rules(&rules);
+        Some(selected)
     }
 
     pub fn set_browser_enabled(&self, index: usize, enabled: bool) {
@@ -188,12 +262,15 @@ impl App {
     pub fn cancel(&self) {
         if !self.busy() {
             self.requests.borrow_mut().cancel();
-            self.timeout_unclaimed.set(self.has_pending());
+            let pending = self.has_pending();
+            self.timeout_unclaimed.set(pending);
+            self.route_unclaimed.set(pending);
         }
     }
 
     pub fn begin_dispatch(&self) -> Option<Retained<NSArray<NSURL>>> {
         self.cancel_timeout();
+        self.route_unclaimed.set(false);
         self.requests.borrow_mut().begin()
     }
 
@@ -214,6 +291,7 @@ impl App {
         self.requests.borrow_mut().finish(success);
         let next = success && self.has_pending();
         self.timeout_unclaimed.set(next);
+        self.route_unclaimed.set(next);
         next
     }
 
@@ -305,6 +383,20 @@ mod tests {
         assert_eq!(app.preview().unwrap().to_string(), "https://first.example");
         app.cancel();
         assert_eq!(app.receive(&urls("https://second.example")), Incoming::Show);
+    }
+
+    #[test]
+    fn route_claims_once_per_request_and_respects_exclusions() {
+        let app = App::default();
+        assert!(app.claim_route().is_none());
+        app.receive(&urls("https://first.example/path"));
+        let _ = app.claim_route();
+        assert!(app.claim_route().is_none());
+        app.begin_dispatch();
+        app.dispatch_finished(false);
+        assert!(app.claim_route().is_none());
+        app.cancel();
+        assert!(!app.has_pending());
     }
 
     #[test]

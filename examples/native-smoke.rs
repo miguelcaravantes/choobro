@@ -19,12 +19,14 @@ mod delegate {
                 ns_string!("AutoOpenSeconds"),
                 ns_string!("AutoOpenBrowser"),
                 ns_string!("ExcludedBrowsers"),
+                ns_string!("RoutingRules"),
             ],
             &[
                 &*objc2_foundation::NSNumber::new_bool(enabled),
                 &*objc2_foundation::NSNumber::new_f64(60.0),
                 &*NSString::from_str(browser_id),
                 &*NSArray::from_retained_slice(&ids),
+                &*NSArray::<AnyObject>::new(),
             ],
         );
         unsafe {
@@ -466,6 +468,80 @@ mod delegate {
                         settings.window.close();
                         assert!(!settings.window.isVisible());
                         assert_eq!(settings.window.title().to_string(), "ChooBro Settings");
+                        let content = settings.window.contentView().unwrap();
+                        assert!(settings.tabs.segmentCount() == 2);
+                        assert_eq!(settings.tabs.selectedSegment(), 0);
+                        assert!(!settings.browsers_pane.isHidden());
+                        assert!(settings.rules_pane.isHidden());
+                        assert_eq!(settings.remove_rule.action(), Some(sel!(removeRule:)));
+                        settings.select_tab(1);
+                        assert_eq!(settings.tabs.selectedSegment(), 1);
+                        assert!(settings.browsers_pane.isHidden());
+                        assert!(!settings.rules_pane.isHidden());
+                        content.layoutSubtreeIfNeeded();
+                        assert!(settings.rules_table.frame().size.height >= 220.0);
+                        assert_eq!(settings.rules_table.numberOfRows(), 0);
+                        assert!(!settings.rules_hint.isHidden());
+                        assert!(!settings.remove_rule.isEnabled());
+                        settings
+                            .rule_domain
+                            .setStringValue(ns_string!("bad domain"));
+                        delegate.add_rule(sel!(addRule:), None);
+                        assert!(!settings.rule_error.isHidden());
+                        assert_eq!(settings.rules_table.numberOfRows(), 0);
+                        if settings.rule_browser.numberOfItems() > 1
+                            && let Some(browser) = state.app.settings_browser(0)
+                        {
+                            settings
+                                .rule_domain
+                                .setStringValue(ns_string!("https://WWW.Example.com/test"));
+                            settings.rule_browser.selectItemAtIndex(1);
+                            delegate.add_rule(sel!(addRule:), None);
+                            assert!(settings.rule_error.isHidden());
+                            assert_eq!(settings.rules_table.numberOfRows(), 1);
+                            assert!(settings.rules_hint.isHidden());
+                            assert!(settings.remove_rule.isEnabled());
+                            assert_eq!(
+                                state.app.rule(0),
+                                Some(browsers::Rule {
+                                    kind: browsers::MatchKind::Domain,
+                                    pattern: "www.example.com".into(),
+                                    browser_id: browser.id.clone(),
+                                })
+                            );
+                            let cell = settings
+                                .rules_table
+                                .viewAtColumn_row_makeIfNecessary(0, 0, true)
+                                .unwrap()
+                                .downcast::<NSTableCellView>()
+                                .unwrap();
+                            assert_eq!(
+                                unsafe { cell.textField() }
+                                    .unwrap()
+                                    .stringValue()
+                                    .to_string(),
+                                "www.example.com"
+                            );
+                            let browser_cell = settings
+                                .rules_table
+                                .viewAtColumn_row_makeIfNecessary(1, 0, true)
+                                .unwrap()
+                                .downcast::<NSTableCellView>()
+                                .unwrap();
+                            assert_eq!(
+                                unsafe { browser_cell.textField() }
+                                    .unwrap()
+                                    .stringValue()
+                                    .to_string(),
+                                browser.name
+                            );
+                            delegate.remove_rule(sel!(removeRule:), None);
+                            assert_eq!(settings.rules_table.numberOfRows(), 0);
+                            assert!(!settings.rules_hint.isHidden());
+                            assert!(!settings.remove_rule.isEnabled());
+                        }
+                        snapshot(&content, ns_string!("target/native-rules-settings.png"));
+                        settings.select_tab(0);
                     }
                     delegate.show_settings(sel!(showSettings:), None);
                     assert!(state.settings.borrow().as_ref().unwrap().window.isVisible());
@@ -523,10 +599,12 @@ mod delegate {
                         chooser.update(
                             Some(&crate::app::ChooserContent {
                                 preview: state.app.preview().unwrap(),
+                                domain: state.app.current_domain(),
                                 selected_row: 0,
                                 count: 1,
                             }),
                             state.app.browser_count(),
+                            false,
                             false,
                             delegate.mtm(),
                         );
@@ -559,6 +637,15 @@ mod delegate {
                     assert_eq!(
                         chooser.preview.stringValue().to_string(),
                         "https://example.invalid/a%2Fb?x=a%26b#test"
+                    );
+                    assert!(!chooser.remember.isHidden());
+                    assert_eq!(chooser.remember.state(), NSControlStateValueOff);
+                    assert!(
+                        chooser
+                            .remember
+                            .title()
+                            .to_string()
+                            .contains("example.invalid")
                     );
                     snapshot(
                         &chooser.window.contentView().unwrap(),
@@ -775,6 +862,7 @@ mod delegate {
     }
 
     fn snapshot(view: &NSView, path: &objc2_foundation::NSString) {
+        view.layoutSubtreeIfNeeded();
         view.window().unwrap().displayIfNeeded();
         let bitmap = view
             .bitmapImageRepForCachingDisplayInRect(view.bounds())

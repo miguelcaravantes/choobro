@@ -15,7 +15,7 @@ ChooBro (**Choose Browser**) lets you pick where each link opens, right when you
 - **Lean by design.** Written in Rust with AppKit. No Electron, WebView, bundled browser engine, or background polling.
 - **Quick to use.** Arrow keys to choose, Return to open. No settings detour for every link.
 - **Your browsers, your rules.** Finds installed browsers automatically. Hide the ones you don't use.
-- **Private by default.** No telemetry, network requests, or browsing history. Links aren't rewritten; only browser preferences are saved.
+- **Private by default.** No telemetry, network requests, or browsing history. Browser preferences and domain rules are saved locally.
 
 ## Install
 
@@ -45,6 +45,7 @@ Open ChooBro, click **Make Default Browser…** in Settings, and approve the mac
 - **Cancel:** press Escape or click Cancel.
 - **Copy:** click Copy Link or press ⌘C. You get the full URL, even when the preview ends in an ellipsis; the chooser stays open.
 - **Customize:** click **CB → Settings** in the menu bar to hide browsers or refresh the list. Browsers are alphabetical by default; choose **Sort → Manual**, then drag browsers or use the arrows beside the list to set the chooser order. Your manual order is saved when you switch back to alphabetical. New browsers appear at the end in manual mode.
+- **Domain rules:** check **Always open `<domain>` in this browser** in the chooser, or add and remove rules in **Settings → Rules**. Exact domains match only that host; `*.example.com` matches `example.com` and its subdomains. Exact rules take priority over wildcard rules. Matching links open directly in the assigned browser; if it is unavailable or hidden, the chooser remains available.
 - **Optional auto-open:** in Settings, enable **Automatically open a browser after waiting**, enter a positive delay in seconds (decimals work), and choose a browser. This is off by default. Keyboard or mouse interaction in the chooser, copying a link, or opening Settings cancels automatic opening for that request; it does not restart. Each later queued request gets its own delay. If the chosen browser is excluded or unavailable, the link stays in the chooser.
 
 Links arriving together open in one browser; later requests wait their turn. Pending links stay in memory, not on disk. Quitting asks before discarding them.
@@ -65,7 +66,8 @@ For DMG installs, replace the app in Applications. Preferences survive updates. 
 ## Good to know
 
 - Only HTTP/HTTPS links sent to the system default browser are handled. Embedded or app-forced browsers bypass ChooBro.
-- Browser profiles, private windows, and routing rules aren't supported.
+- **Microsoft Safe Links:** Recognized Teams and Outlook wrappers are automatically replaced with their embedded destination for display, copying, routing, and opening. This bypasses Microsoft's Safe Links reputation check; only open links you trust.
+- Browser profiles and private windows aren't supported.
 - Older macOS compatibility, startup speed, and RAM usage haven't been fully verified or benchmarked.
 - Before removing ChooBro, choose another default browser in macOS Settings.
 
