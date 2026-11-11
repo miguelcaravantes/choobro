@@ -108,7 +108,28 @@ mod delegate {
                         );
                         assert!(state.timeout.borrow().as_ref().unwrap().isValid());
                         assert!(state.timeout_monitor.borrow().is_some());
+                        let content = chooser.window.contentView().unwrap();
+                        content.layoutSubtreeIfNeeded();
+                        let checkbox_frame = chooser
+                            .remember
+                            .convertRect_toView(chooser.remember.bounds(), Some(&content));
+                        let open_frame = chooser
+                            .open
+                            .convertRect_toView(chooser.open.bounds(), Some(&content));
                         let timer = state.timeout.borrow().as_ref().unwrap().clone();
+                        let countdown = state.countdown.borrow().as_ref().unwrap().clone();
+                        timer.setFireDate(&objc2_foundation::NSDate::dateWithTimeIntervalSinceNow(
+                            3.0,
+                        ));
+                        countdown.fire();
+                        assert!(chooser.message.stringValue().to_string().contains("in 3s."));
+                        content.layoutSubtreeIfNeeded();
+                        assert_eq!(
+                            chooser
+                                .remember
+                                .convertRect_toView(chooser.remember.bounds(), Some(&content)),
+                            checkbox_frame
+                        );
                         delegate.selection_changed(sel!(tableViewSelectionDidChange:), &*unsafe {
                             NSNotification::notificationWithName_object(
                                 ns_string!("NSTableViewSelectionDidChangeNotification"),
@@ -116,8 +137,23 @@ mod delegate {
                             )
                         });
                         assert!(!timer.isValid());
+                        assert!(!countdown.isValid());
+                        assert!(state.countdown.borrow().is_none());
                         assert!(state.timeout.borrow().is_none());
                         assert!(state.timeout_monitor.borrow().is_none());
+                        content.layoutSubtreeIfNeeded();
+                        assert_eq!(
+                            chooser
+                                .remember
+                                .convertRect_toView(chooser.remember.bounds(), Some(&content)),
+                            checkbox_frame
+                        );
+                        assert_eq!(
+                            chooser
+                                .open
+                                .convertRect_toView(chooser.open.bounds(), Some(&content)),
+                            open_frame
+                        );
                         delegate.refresh_chooser(true);
                         assert!(state.timeout.borrow().is_none());
                         delegate.timeout_fired(sel!(timeoutFired:), &timer);

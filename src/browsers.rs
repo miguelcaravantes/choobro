@@ -278,7 +278,11 @@ impl AutoOpen {
         let seconds = defaults.doubleForKey(ns_string!("AutoOpenSeconds"));
         Self {
             enabled: defaults.boolForKey(ns_string!("AutoOpenEnabled")),
-            seconds: if valid_timeout(seconds) { seconds } else { 5.0 },
+            seconds: if valid_timeout(seconds) {
+                seconds
+            } else {
+                10.0
+            },
             browser_id: defaults
                 .stringForKey(ns_string!("AutoOpenBrowser"))
                 .map(|value| value.to_string())
@@ -703,7 +707,7 @@ mod tests {
         }
         let preference = AutoOpen::from_defaults(&defaults);
         assert!(!preference.enabled);
-        assert_eq!(preference.seconds, 5.0);
+        assert_eq!(preference.seconds, 10.0);
         assert!(valid_timeout(0.25));
         assert!(valid_timeout(86400.0));
         for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY] {

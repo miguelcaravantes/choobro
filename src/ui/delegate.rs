@@ -34,6 +34,7 @@ pub struct State {
     rejected_request: Cell<Option<Rejection>>,
     showing_rejection: Cell<bool>,
     timeout: RefCell<Option<Retained<NSTimer>>>,
+    countdown: RefCell<Option<Retained<NSTimer>>>,
     timeout_monitor: RefCell<Option<Retained<AnyObject>>>,
     updating_chooser: Cell<bool>,
     timeout_browser: RefCell<Option<String>>,
@@ -252,6 +253,13 @@ define_class!(
             }
         }
 
+        #[unsafe(method(countdownTick:))]
+        fn countdown_tick(&self, timer: &NSTimer) {
+            if self.ivars().countdown.borrow().as_ref().is_some_and(|current| &**current == timer) {
+                self.update_countdown();
+            }
+        }
+
         #[unsafe(method(copyLink:))]
         fn copy_link(&self, _sender: Option<&AnyObject>) {
             self.copy_link_to(&NSPasteboard::generalPasteboard());
@@ -392,6 +400,9 @@ impl Delegate {
 
     fn cancel_timeout(&self) {
         self.ivars().app.cancel_timeout();
+        if let Some(timer) = self.ivars().countdown.borrow_mut().take() {
+            timer.invalidate();
+        }
         if let Some(timer) = self.ivars().timeout.borrow_mut().take() {
             timer.invalidate();
             if let Some(chooser) = self.ivars().chooser.get() {
@@ -458,16 +469,40 @@ impl Delegate {
             )
         };
         self.ivars().timeout.replace(Some(timer));
+        let countdown = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                1.0,
+                self,
+                sel!(countdownTick:),
+                None,
+                true,
+            )
+        };
+        self.ivars().countdown.replace(Some(countdown));
+        self.update_countdown();
+    }
+
+    fn update_countdown(&self) {
+        let Some(seconds) = self
+            .ivars()
+            .timeout
+            .borrow()
+            .as_ref()
+            .map(|timer| timer.fireDate().timeIntervalSinceNow().max(0.0).ceil())
+        else {
+            return;
+        };
         if let Some(chooser) = self.ivars().chooser.get()
+            && let Some(id) = self.ivars().timeout_browser.borrow().as_ref()
             && let Some(browser) = self
                 .ivars()
                 .app
-                .timeout_browser(&preference.browser_id)
+                .timeout_browser(id)
                 .and_then(|index| self.ivars().app.browser(index))
         {
             chooser.message.setStringValue(&NSString::from_str(&format!(
-                "Opens in {} after {} seconds. Interact to cancel automatic opening.",
-                browser.name, preference.seconds
+                "Opening in {} in {seconds:.0}s. Interact to cancel automatic opening.",
+                browser.name
             )));
         }
     }

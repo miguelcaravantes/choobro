@@ -495,6 +495,10 @@ pub fn chooser(target: &Delegate) -> Chooser {
     message.setTextColor(Some(&NSColor::secondaryLabelColor()));
     root.addArrangedSubview(&message);
     fill_width(&message, &root);
+    message
+        .heightAnchor()
+        .constraintEqualToConstant(36.0)
+        .setActive(true);
     let actions = stack(mtm, false);
     let settings = button("Settings…", ButtonAction::Settings, target);
     let cancel = button("Cancel", ButtonAction::Cancel, target);
