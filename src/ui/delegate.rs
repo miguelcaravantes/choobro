@@ -183,13 +183,8 @@ define_class!(
                     if column.is_some_and(|column| &*column.identifier() == ns_string!("ruleDomain")) {
                         Some(ui::rule_domain_cell(&rule.pattern, table))
                     } else {
-                        let browser = (0..self.ivars().app.settings_browser_count())
-                            .filter_map(|index| self.ivars().app.settings_browser(index))
-                            .find(|browser| browser.target_key() == rule.target_key);
-                        let excluded = browsers::exclusions();
-                        let hidden = browser.as_ref().is_some_and(|browser| !browser.is_visible(&excluded));
-                        let label = browsers::rule_target_label(&rule.target_key);
-                        Some(ui::rule_browser_cell(browser.as_ref(), &label, hidden, table))
+                        let targets = self.ivars().app.settings_rule_targets();
+                        Some(ui::rule_browser_cell(&rule, &targets, table, self))
                     }
                 } else {
                     self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, table, 8.0))
@@ -232,6 +227,24 @@ define_class!(
         #[unsafe(method(addRule:))]
         fn add_rule(&self, _sender: Option<&AnyObject>) {
             self.save_rule_from_settings();
+        }
+
+        #[unsafe(method(changeRuleTarget:))]
+        fn change_rule_target(&self, sender: &NSPopUpButton) {
+            let settings = self.ivars().settings.borrow();
+            let Some(settings) = settings.as_ref() else { return };
+            let Ok(row) = usize::try_from(settings.rules_table.rowForView(sender)) else { return };
+            let Some(rule) = self.ivars().app.rule(row) else { return };
+            let Some(key) = sender.selectedItem()
+                .and_then(|item| item.representedObject())
+                .and_then(|object| object.downcast::<NSString>().ok())
+            else { return };
+            let key = key.to_string();
+            if key != rule.target_key && self.ivars().app.save_domain_rule(&rule.pattern, &key).is_some()
+                && sender.itemAtIndex(0).is_some_and(|item| item.representedObject().is_none())
+            {
+                sender.removeItemAtIndex(0);
+            }
         }
 
         #[unsafe(method(removeRule:))]

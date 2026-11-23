@@ -11,7 +11,7 @@ use objc2_foundation::{
 
 use crate::{
     app::ChooserContent,
-    browsers::{Browser, ProfileNotice},
+    browsers::{Browser, ProfileNotice, Rule, rule_target_label},
     delegate::Delegate,
 };
 
@@ -740,50 +740,62 @@ pub fn rule_domain_cell(pattern: &str, table: &NSTableView) -> Retained<NSView> 
 }
 
 pub fn rule_browser_cell(
-    browser: Option<&Browser>,
-    target_label: &str,
-    excluded: bool,
+    rule: &Rule,
+    browsers: &[Browser],
     table: &NSTableView,
+    target: &Delegate,
 ) -> Retained<NSView> {
-    if let Some(browser) = browser
-        && !excluded
-    {
-        return browser_cell(browser, table, 4.0);
-    }
-    let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("ruleStatus"), None) }
-        .and_then(|view| view.downcast::<NSTableCellView>().ok())
+    let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("ruleTarget"), None) }
         .unwrap_or_else(|| {
             let mtm = table.mtm();
-            let cell = NSTableCellView::new(mtm);
-            cell.setIdentifier(Some(ns_string!("ruleStatus")));
-            let text = label("", mtm);
-            text.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
-            text.setTextColor(Some(&NSColor::secondaryLabelColor()));
-            text.setTranslatesAutoresizingMaskIntoConstraints(false);
-            cell.addSubview(&text);
+            let cell = NSView::new(mtm);
+            cell.setIdentifier(Some(ns_string!("ruleTarget")));
+            let popup = NSPopUpButton::new(mtm);
+            popup.setAutoenablesItems(false);
             unsafe {
-                cell.setTextField(Some(&text));
+                popup.setTarget(Some(target));
+                popup.setAction(Some(sel!(changeRuleTarget:)));
             }
+            popup.setTranslatesAutoresizingMaskIntoConstraints(false);
+            cell.addSubview(&popup);
             NSLayoutConstraint::activateConstraints(&NSArray::from_retained_slice(&[
-                text.leadingAnchor()
+                popup
+                    .leadingAnchor()
                     .constraintEqualToAnchor_constant(&cell.leadingAnchor(), 4.0),
-                text.trailingAnchor()
+                popup
+                    .trailingAnchor()
                     .constraintEqualToAnchor_constant(&cell.trailingAnchor(), -8.0),
-                text.centerYAnchor()
+                popup
+                    .centerYAnchor()
                     .constraintEqualToAnchor(&cell.centerYAnchor()),
             ]));
             cell
         });
-    let text = match browser {
-        Some(browser) => format!("{} (hidden)", browser.name),
-        None => format!("Unavailable ({target_label})"),
-    };
-    let value = NSString::from_str(&text);
-    unsafe { cell.textField() }
-        .expect("rule status cell text subview")
-        .setStringValue(&value);
-    cell.setToolTip(Some(&value));
-    Retained::into_super(cell)
+    let popup = cell
+        .subviews()
+        .objectAtIndex(0)
+        .downcast::<NSPopUpButton>()
+        .expect("rule target popup");
+    let status = browsers
+        .iter()
+        .find(|browser| browser.target_key() == rule.target_key)
+        .map_or_else(
+            || format!("Unavailable ({})", rule_target_label(&rule.target_key)),
+            |browser| format!("{} (hidden)", browser.name),
+        );
+    populate_browser_popup(&popup, browsers, &rule.target_key, &status, false);
+    if popup.indexOfSelectedItem() == 0 {
+        popup.itemAtIndex(0).unwrap().setEnabled(false);
+        popup.setEnabled(popup.numberOfItems() > 1);
+    } else {
+        popup.removeItemAtIndex(0);
+        popup.setEnabled(true);
+    }
+    popup.setAccessibilityLabel(Some(&NSString::from_str(&format!(
+        "Browser or profile for {}",
+        rule.pattern
+    ))));
+    cell
 }
 
 pub fn settings(target: &Delegate, configuring: bool) -> Settings {
@@ -1026,7 +1038,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     let browser_col =
         NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("ruleBrowser"));
     browser_col.setTitle(ns_string!("Browser or profile"));
-    browser_col.setWidth(240.0);
+    browser_col.setWidth(216.0);
     browser_col.setMinWidth(140.0);
     rules_table.addTableColumn(&domain_col);
     rules_table.addTableColumn(&browser_col);
@@ -1046,6 +1058,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     let rules_scroll = NSScrollView::new(mtm);
     rules_scroll.setDocumentView(Some(&rules_table));
     rules_scroll.setHasVerticalScroller(true);
+    rules_scroll.setScrollerStyle(NSScrollerStyle::Legacy);
     rules_scroll.setAutohidesScrollers(true);
     rules_scroll.setBorderType(NSBorderType::BezelBorder);
     let rules_list_area = stack(mtm, false);

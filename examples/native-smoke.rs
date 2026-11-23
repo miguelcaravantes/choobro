@@ -602,25 +602,45 @@ mod delegate {
                                     .to_string(),
                                 "www.example.com"
                             );
-                            let browser_cell = settings
-                                .rules_table
-                                .viewAtColumn_row_makeIfNecessary(1, 0, true)
-                                .unwrap()
-                                .downcast::<NSTableCellView>()
-                                .unwrap();
-                            assert_eq!(
-                                unsafe { browser_cell.textField() }
+                            let rule_popup = |row| {
+                                settings
+                                    .rules_table
+                                    .viewAtColumn_row_makeIfNecessary(1, row, true)
                                     .unwrap()
-                                    .stringValue()
-                                    .to_string(),
-                                browser.name
+                                    .subviews()
+                                    .objectAtIndex(0)
+                                    .downcast::<NSPopUpButton>()
+                                    .unwrap()
+                            };
+                            assert_eq!(rule_popup(0).title().to_string(), browser.name);
+                            let missing = "io.github.choobro.missing-browser";
+                            assert_eq!(
+                                state.app.save_domain_rule("*.example.org", missing),
+                                Some(1)
                             );
+                            delegate.update_rules_settings(Some(0));
+                            let popup = rule_popup(1);
+                            assert!(popup.title().to_string().starts_with("Unavailable"));
+                            assert!(!popup.itemAtIndex(0).unwrap().isEnabled());
+                            assert_eq!(settings.rules_table.selectedRow(), 0);
+                            popup.selectItemAtIndex(1);
+                            assert!(unsafe { popup.sendAction_to(popup.action(), Some(delegate)) });
+                            assert_eq!(popup.title().to_string(), browser.name);
+                            assert_eq!(settings.rules_table.numberOfRows(), 2);
+                            let expected = browsers::Rule {
+                                kind: browsers::MatchKind::Domain,
+                                pattern: "*.example.org".into(),
+                                target_key: browser.id.clone(),
+                            };
+                            assert_eq!(state.app.rule(1).as_ref(), Some(&expected));
+                            assert_eq!(state.app.rule(0).unwrap().pattern, "www.example.com");
+                            check_rule_scrollbar(delegate, settings, &browser.id);
+                            delegate.remove_rule(sel!(removeRule:), None);
                             delegate.remove_rule(sel!(removeRule:), None);
                             assert_eq!(settings.rules_table.numberOfRows(), 0);
                             assert!(!settings.rules_hint.isHidden());
                             assert!(!settings.remove_rule.isEnabled());
                         }
-                        snapshot(&content, ns_string!("target/native-rules-settings.png"));
                         if let Some(browser) = state.app.settings_browser(0) {
                             let fake = browsers::Browser {
                                 id: "io.github.choobro.test-browser".into(),
@@ -998,6 +1018,38 @@ mod delegate {
             }
         }
         assert!(reused, "settings refresh must reuse native browser cells");
+    }
+
+    fn check_rule_scrollbar(delegate: &Delegate, settings: &ui::Settings, target_key: &str) {
+        let app = &delegate.ivars().app;
+        let initial_count = app.rule_count();
+        for index in 0..12 {
+            app.save_domain_rule(&format!("rule-{index}.example.org"), target_key);
+        }
+        delegate.update_rules_settings(Some(0));
+        let content = settings.window.contentView().unwrap();
+        content.layoutSubtreeIfNeeded();
+        let table = &settings.rules_table;
+        let scroll = table.enclosingScrollView().unwrap();
+        let scroller = scroll.verticalScroller().unwrap();
+        let popup = table
+            .viewAtColumn_row_makeIfNecessary(1, 0, true)
+            .unwrap()
+            .subviews()
+            .objectAtIndex(0);
+        let frame = popup.convertRect_toView(popup.bounds(), Some(&scroll));
+        assert!(table.frame().size.height > scroll.contentSize().height);
+        assert!(!scroller.isHidden());
+        assert!(
+            frame.origin.x + frame.size.width <= scroller.frame().origin.x,
+            "rule dropdown {frame:?} overlaps scrollbar {:?}",
+            scroller.frame()
+        );
+        snapshot(&content, ns_string!("target/native-rules-settings.png"));
+        for index in (initial_count..app.rule_count()).rev() {
+            app.remove_rule(index);
+        }
+        delegate.update_rules_settings(Some(0));
     }
 
     fn snapshot(view: &NSView, path: &objc2_foundation::NSString) {
