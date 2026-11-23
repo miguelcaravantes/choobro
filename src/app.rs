@@ -21,6 +21,7 @@ pub struct App {
     default_failed: Cell<bool>,
     timeout_unclaimed: Cell<bool>,
     route_unclaimed: Cell<bool>,
+    remembered_rule: RefCell<Option<browsers::Rule>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -28,6 +29,13 @@ pub enum Incoming {
     Show,
     Queued,
     Rejected(Rejection),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SavedTarget {
+    Unavailable,
+    Ambiguous,
+    Unique(usize),
 }
 
 pub enum OpenRequest {
@@ -87,9 +95,10 @@ impl App {
         self.browsers.borrow().get(index).cloned()
     }
 
-    pub fn current_domain(&self) -> Option<String> {
-        let requests = self.requests.borrow();
-        browsers::shared_domain(requests.current()?)
+    pub fn show_browser_path(&self, browser: &Browser) -> bool {
+        self.browsers.borrow().iter().any(|other| {
+            browser.path != other.path && browser.id == other.id && browser.profile == other.profile
+        })
     }
 
     pub fn claim_route(&self) -> Option<browsers::RuleRoute> {
@@ -106,19 +115,30 @@ impl App {
         let requests = self.requests.borrow();
         let rules = load();
         let route = browsers::rule_route(&rules, requests.current()?)?;
-        if route == browsers::RuleRoute::MixedProfiles {
-            self.cancel_timeout();
-        }
+        self.cancel_timeout();
         *self.rules.borrow_mut() = rules;
         self.rules_loaded.set(true);
         Some(route)
     }
 
-    pub fn route_target(&self, key: &str) -> Option<usize> {
-        self.browsers
-            .borrow()
+    pub fn route_target(&self, key: &str) -> SavedTarget {
+        self.saved_target(|browser| browser.target_key() == key)
+    }
+
+    fn saved_target(&self, matches: impl Fn(&Browser) -> bool) -> SavedTarget {
+        let browsers = self.browsers.borrow();
+        let mut rows = browsers
             .iter()
-            .position(|browser| browser.target_key() == key)
+            .enumerate()
+            .filter(|(_, browser)| matches(browser));
+        let Some((row, _)) = rows.next() else {
+            return SavedTarget::Unavailable;
+        };
+        if rows.next().is_some() {
+            SavedTarget::Ambiguous
+        } else {
+            SavedTarget::Unique(row)
+        }
     }
 
     pub fn refresh(&self, selected: Option<usize>) -> Option<ChooserContent> {
@@ -283,11 +303,8 @@ impl App {
         self.timeout_unclaimed.set(false);
     }
 
-    pub fn timeout_browser(&self, id: &str) -> Option<usize> {
-        self.browsers
-            .borrow()
-            .iter()
-            .position(|browser| browser.id == id && browser.profile.is_none())
+    pub fn timeout_browser(&self, id: &str) -> SavedTarget {
+        self.saved_target(|browser| browser.id == id && browser.profile.is_none())
     }
 
     pub fn cancel(&self) {
@@ -299,13 +316,24 @@ impl App {
         }
     }
 
-    pub fn begin_dispatch(&self) -> Option<Retained<NSArray<NSURL>>> {
+    pub fn begin_dispatch(
+        &self,
+        remember_target: Option<&str>,
+    ) -> Option<Retained<NSArray<NSURL>>> {
+        let urls = self.requests.borrow_mut().begin()?;
         self.cancel_timeout();
         self.route_unclaimed.set(false);
-        self.requests.borrow_mut().begin()
+        *self.remembered_rule.borrow_mut() = remember_target.and_then(|target_key| {
+            Some(browsers::Rule {
+                kind: browsers::MatchKind::Domain,
+                pattern: browsers::shared_domain(&urls)?,
+                target_key: target_key.to_owned(),
+            })
+        });
+        Some(urls)
     }
 
-    pub fn open(&self, index: usize) -> OpenRequest {
+    pub fn open(&self, index: usize, remember: bool) -> OpenRequest {
         if self.busy() {
             return OpenRequest::None;
         }
@@ -327,18 +355,23 @@ impl App {
         if !browsers::available(&browser) {
             return OpenRequest::Unavailable;
         }
-        match self.begin_dispatch() {
+        let target = remember.then(|| browser.target_key());
+        match self.begin_dispatch(target.as_deref()) {
             Some(urls) => OpenRequest::Ready(browser, urls, arguments),
             None => OpenRequest::None,
         }
     }
 
-    pub fn dispatch_finished(&self, success: bool) -> bool {
+    pub fn dispatch_finished(&self, success: bool) -> (bool, Option<browsers::Rule>) {
+        if !self.busy() {
+            return (false, None);
+        }
+        let remembered_rule = self.remembered_rule.borrow_mut().take();
         self.requests.borrow_mut().finish(success);
         let next = success && self.has_pending();
         self.timeout_unclaimed.set(next);
         self.route_unclaimed.set(next);
-        next
+        (next, remembered_rule.filter(|_| success))
     }
 
     pub fn configuring(&self) -> bool {
@@ -414,17 +447,17 @@ mod tests {
         let app = App::default();
         app.receive(&urls("https://first.example"));
         app.receive(&urls("https://second.example"));
-        assert!(app.begin_dispatch().is_some());
-        assert!(app.begin_dispatch().is_none());
+        assert!(app.begin_dispatch(None).is_some());
+        assert!(app.begin_dispatch(None).is_none());
         assert!(app.busy());
         app.cancel();
-        assert!(!app.dispatch_finished(false));
+        assert!(!app.dispatch_finished(false).0);
         assert_eq!(app.preview().unwrap().to_string(), "https://first.example");
-        assert!(app.begin_dispatch().is_some());
-        assert!(app.dispatch_finished(true));
+        assert!(app.begin_dispatch(None).is_some());
+        assert!(app.dispatch_finished(true).0);
         assert_eq!(app.preview().unwrap().to_string(), "https://second.example");
-        assert!(app.begin_dispatch().is_some());
-        assert!(!app.dispatch_finished(true));
+        assert!(app.begin_dispatch(None).is_some());
+        assert!(!app.dispatch_finished(true).0);
         assert!(!app.has_pending());
         assert!(!app.busy());
     }
@@ -451,7 +484,7 @@ mod tests {
         app.receive(&urls("https://first.example/path"));
         let _ = app.claim_route();
         assert!(app.claim_route().is_none());
-        app.begin_dispatch();
+        app.begin_dispatch(None);
         app.dispatch_finished(false);
         assert!(app.claim_route().is_none());
         app.cancel();
@@ -468,10 +501,10 @@ mod tests {
         assert!(!app.claim_timeout());
         app.cancel_timeout();
         assert!(!app.claim_timeout());
-        app.begin_dispatch();
+        app.begin_dispatch(None);
         app.dispatch_finished(false);
         assert!(!app.claim_timeout());
-        app.begin_dispatch();
+        app.begin_dispatch(None);
         app.dispatch_finished(true);
         assert!(app.claim_timeout());
         app.cancel();
@@ -498,33 +531,135 @@ mod tests {
         };
         let key = profile.target_key();
         app.browsers.borrow_mut().push(chrome.clone());
-        assert_eq!(app.route_target(&key), None);
+        assert_eq!(app.route_target(&key), SavedTarget::Unavailable);
         app.browsers.borrow_mut().insert(0, profile);
-        assert_eq!(app.route_target(&key), Some(0));
-        assert_eq!(app.route_target(&chrome.id), Some(1));
-        assert_eq!(app.timeout_browser(&chrome.id), Some(1));
+        assert_eq!(app.route_target(&key), SavedTarget::Unique(0));
+        assert_eq!(app.route_target(&chrome.id), SavedTarget::Unique(1));
+        assert_eq!(app.timeout_browser(&chrome.id), SavedTarget::Unique(1));
     }
 
     #[test]
-    fn mixed_batch_with_a_hidden_profile_rule_cancels_standalone_auto_open() {
-        let app = App::default();
-        let batch = NSArray::from_retained_slice(&[
-            urls("https://work.example").objectAtIndex(0),
-            urls("https://unruled.example").objectAtIndex(0),
-        ]);
-        app.receive(&batch);
-        let hidden_profile = "profile:com.google.Chrome/Profile 1";
-        assert!(app.route_target(hidden_profile).is_none());
-        assert_eq!(
-            app.claim_route_with(|| vec![browsers::Rule {
+    fn unavailable_rules_and_mixed_routes_suppress_the_fallback_timeout() {
+        for (links, other_target, expected) in [
+            (
+                vec!["https://work.example"],
+                None,
+                browsers::RuleRoute::Target("missing.browser".into()),
+            ),
+            (
+                vec!["https://work.example", "https://unruled.example"],
+                None,
+                browsers::RuleRoute::MixedTargets,
+            ),
+            (
+                vec!["https://unruled.example", "https://work.example"],
+                Some("other.browser"),
+                browsers::RuleRoute::MixedTargets,
+            ),
+        ] {
+            let app = App::default();
+            let batch = links
+                .iter()
+                .map(|link| urls(link).objectAtIndex(0))
+                .collect::<Vec<_>>();
+            app.receive(&NSArray::from_retained_slice(&batch));
+            let mut rules = vec![browsers::Rule {
                 kind: browsers::MatchKind::Domain,
                 pattern: "work.example".into(),
-                target_key: hidden_profile.into(),
-            }]),
-            Some(browsers::RuleRoute::MixedProfiles)
+                target_key: "missing.browser".into(),
+            }];
+            if let Some(key) = other_target {
+                rules.push(browsers::Rule {
+                    kind: browsers::MatchKind::Domain,
+                    pattern: "unruled.example".into(),
+                    target_key: key.into(),
+                });
+            }
+            assert_eq!(app.claim_route_with(|| rules), Some(expected));
+            assert_eq!(
+                app.route_target("missing.browser"),
+                SavedTarget::Unavailable
+            );
+            assert!(!app.claim_timeout());
+            assert!(app.has_pending());
+        }
+    }
+
+    #[test]
+    fn duplicate_installations_are_ambiguous_by_saved_key_but_keep_distinct_rows() {
+        let app = App::default();
+        let chrome = Browser {
+            id: "com.google.Chrome".into(),
+            name: "Chrome".into(),
+            path: "/Applications/Chrome.app".into(),
+            url: NSURL::fileURLWithPath(ns_string!("/Applications/Chrome.app")),
+            icon: objc2_app_kit::NSImage::new(),
+            profile: None,
+        };
+        let other = Browser {
+            path: "/Other/Chrome.app".into(),
+            url: NSURL::fileURLWithPath(ns_string!("/Other/Chrome.app")),
+            ..chrome.clone()
+        };
+        let profile = Browser {
+            profile: Some("Default".into()),
+            ..chrome.clone()
+        };
+        let other_profile = Browser {
+            profile: profile.profile.clone(),
+            ..other.clone()
+        };
+        let key = profile.target_key();
+        *app.browsers.borrow_mut() = vec![
+            chrome.clone(),
+            other.clone(),
+            profile,
+            other_profile.clone(),
+        ];
+        assert_eq!(app.route_target(&chrome.id), SavedTarget::Ambiguous);
+        assert_eq!(app.timeout_browser(&chrome.id), SavedTarget::Ambiguous);
+        assert_eq!(app.route_target(&key), SavedTarget::Ambiguous);
+        assert!(app.show_browser_path(&chrome));
+        assert!(app.show_browser_path(&other_profile));
+        assert_eq!(app.browser(1).unwrap().path, other.path);
+        assert_eq!(app.browser(3).unwrap().path, other.path);
+        assert_eq!(
+            selected_browser_row(&app.browsers.borrow(), Some(&other_profile)),
+            3
         );
-        assert!(!app.claim_timeout());
-        assert!(app.has_pending());
+    }
+
+    #[test]
+    fn remembered_rule_is_released_only_for_successful_original_request() {
+        let app = App::default();
+        let prior = browsers::Rule {
+            kind: browsers::MatchKind::Domain,
+            pattern: "first.example".into(),
+            target_key: "prior.browser".into(),
+        };
+        app.rules.borrow_mut().push(prior.clone());
+        app.receive(&urls("https://first.example"));
+        assert!(app.begin_dispatch(Some("failed.browser")).is_some());
+        app.receive(&urls("https://second.example"));
+        assert_eq!(app.dispatch_finished(false), (false, None));
+        assert_eq!(app.rule(0), Some(prior.clone()));
+        assert!(app.begin_dispatch(Some("chosen.browser")).is_some());
+        assert!(app.begin_dispatch(Some("wrong.browser")).is_none());
+        assert_eq!(
+            app.dispatch_finished(true),
+            (
+                true,
+                Some(browsers::Rule {
+                    target_key: "chosen.browser".into(),
+                    ..prior
+                })
+            )
+        );
+        assert_eq!(app.preview().unwrap().to_string(), "https://second.example");
+        assert_eq!(app.dispatch_finished(true), (false, None));
+        assert!(app.claim_timeout());
+        assert!(app.begin_dispatch(None).is_some());
+        assert_eq!(app.dispatch_finished(true), (false, None));
     }
 
     #[test]
@@ -543,7 +678,10 @@ mod tests {
             "https://example.com/{}",
             "a".repeat(25 * 1024)
         )));
-        assert!(matches!(app.open(0), OpenRequest::ProfileBatchTooLarge));
+        assert!(matches!(
+            app.open(0, false),
+            OpenRequest::ProfileBatchTooLarge
+        ));
         assert!(!app.busy());
         assert!(app.has_pending());
     }
@@ -552,7 +690,7 @@ mod tests {
     fn invalid_selection_does_not_start_dispatch() {
         let app = App::default();
         app.receive(&urls("https://example.com"));
-        assert!(matches!(app.open(0), OpenRequest::None));
+        assert!(matches!(app.open(0, false), OpenRequest::None));
         assert!(!app.busy());
         assert!(app.has_pending());
     }

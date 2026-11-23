@@ -608,7 +608,12 @@ pub fn chooser(target: &Delegate) -> Chooser {
     }
 }
 
-pub fn browser_cell(browser: &Browser, table: &NSTableView, icon_inset: f64) -> Retained<NSView> {
+pub fn browser_cell(
+    browser: &Browser,
+    table: &NSTableView,
+    icon_inset: f64,
+    show_path: bool,
+) -> Retained<NSView> {
     let cell = unsafe { table.makeViewWithIdentifier_owner(ns_string!("browser"), None) }
         .and_then(|view| view.downcast::<NSTableCellView>().ok())
         .unwrap_or_else(|| {
@@ -618,6 +623,7 @@ pub fn browser_cell(browser: &Browser, table: &NSTableView, icon_inset: f64) -> 
             let icon = NSImageView::new(mtm);
             icon.setTranslatesAutoresizingMaskIntoConstraints(false);
             let text = label("", mtm);
+            text.setLineBreakMode(NSLineBreakMode::ByTruncatingMiddle);
             text.setTranslatesAutoresizingMaskIntoConstraints(false);
             cell.addSubview(&icon);
             cell.addSubview(&text);
@@ -641,9 +647,14 @@ pub fn browser_cell(browser: &Browser, table: &NSTableView, icon_inset: f64) -> 
             ]));
             cell
         });
+    let title = if show_path {
+        format!("{} — {}", browser.name, browser.path)
+    } else {
+        browser.name.clone()
+    };
     unsafe { cell.textField() }
         .expect("browser cell text subview")
-        .setStringValue(&NSString::from_str(&browser.name));
+        .setStringValue(&NSString::from_str(&title));
     unsafe { cell.imageView() }
         .expect("browser cell image subview")
         .setImage(Some(&browser.icon));

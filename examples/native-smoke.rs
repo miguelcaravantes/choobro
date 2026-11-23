@@ -12,6 +12,10 @@ mod delegate {
     use objc2_foundation::NSIndexSet;
 
     fn timeout_preferences(enabled: bool, browser_id: &str, excluded: &[String]) {
+        preferences(enabled, browser_id, excluded, &[]);
+    }
+
+    fn preferences(enabled: bool, browser_id: &str, excluded: &[String], rules: &[browsers::Rule]) {
         let ids: Vec<_> = excluded.iter().map(|id| NSString::from_str(id)).collect();
         let values = objc2_foundation::NSDictionary::<NSString, AnyObject>::from_slices(
             &[
@@ -28,12 +32,13 @@ mod delegate {
                 &*objc2_foundation::NSNumber::new_f64(60.0),
                 &*NSString::from_str(browser_id),
                 &*NSArray::from_retained_slice(&ids),
-                &*NSArray::<AnyObject>::new(),
+                &*browsers::rule_values(rules),
             ],
         );
+        let defaults = objc2_foundation::NSUserDefaults::standardUserDefaults();
         unsafe {
-            objc2_foundation::NSUserDefaults::standardUserDefaults()
-                .setVolatileDomain_forName(&values, objc2_foundation::NSArgumentDomain);
+            defaults.removeVolatileDomainForName(objc2_foundation::NSArgumentDomain);
+            defaults.setVolatileDomain_forName(&values, objc2_foundation::NSArgumentDomain);
         }
     }
 
@@ -48,17 +53,10 @@ mod delegate {
         if std::env::args().any(|argument| argument == "--all-excluded") {
             autoreleasepool(|_| {
                 let ids: Vec<_> = browsers::discover_all()
-                    .iter()
-                    .map(|browser| NSString::from_str(&browser.id))
+                    .into_iter()
+                    .map(|browser| browser.id)
                     .collect();
-                let domain = objc2_foundation::NSDictionary::<NSString, AnyObject>::from_slices(
-                    &[ns_string!("ExcludedBrowsers")],
-                    &[&*NSArray::from_retained_slice(&ids)],
-                );
-                unsafe {
-                    objc2_foundation::NSUserDefaults::standardUserDefaults()
-                        .setVolatileDomain_forName(&domain, objc2_foundation::NSArgumentDomain);
-                }
+                timeout_preferences(false, "", &ids);
             });
         }
         let will_launch = RcBlock::new(|_notification: std::ptr::NonNull<NSNotification>| {
@@ -95,7 +93,15 @@ mod delegate {
                     assert!(state.showing_rejection.replace(false));
                     let chooser = state.chooser.get().unwrap();
                     assert!(state.timeout.borrow().is_none());
-                    if let Some(browser) = state.app.browser(0) {
+                    if let Some(browser) = (0..state.app.browser_count())
+                        .filter_map(|index| state.app.browser(index))
+                        .find(|browser| {
+                            matches!(
+                                state.app.timeout_browser(&browser.id),
+                                SavedTarget::Unique(_)
+                            )
+                        })
+                    {
                         let exclusions: Vec<_> = browsers::exclusions().into_iter().collect();
                         delegate.cancel_request(sel!(cancelRequest:), None);
                         timeout_preferences(true, &browser.id, &exclusions);
@@ -170,11 +176,36 @@ mod delegate {
                         let timer = state.timeout.borrow().as_ref().unwrap().clone();
                         let mut excluded = exclusions.clone();
                         excluded.push(browser.id.clone());
-                        timeout_preferences(true, &browser.id, &excluded);
+                        timeout_preferences(true, "io.github.choobro.missing-browser", &excluded);
                         timer.fire();
                         assert!(state.timeout.borrow().is_none());
                         assert!(!state.app.busy());
                         assert!(state.app.has_pending());
+                        let rules = [browsers::Rule {
+                            kind: browsers::MatchKind::Domain,
+                            pattern: "example.invalid".into(),
+                            target_key: "io.github.choobro.missing-browser".into(),
+                        }];
+                        preferences(true, &browser.id, &exclusions, &rules);
+                        let mixed = NSArray::from_retained_slice(&[
+                            urls.objectAtIndex(0),
+                            NSURL::URLWithString(ns_string!("https://unruled.invalid")).unwrap(),
+                        ]);
+                        for (links, notice) in [
+                            (&urls, "saved by your rule is unavailable"),
+                            (&mixed, "don’t share the same rule target"),
+                        ] {
+                            delegate.cancel_request(sel!(cancelRequest:), None);
+                            delegate.open_urls(
+                                sel!(application:openURLs:),
+                                &NSApplication::sharedApplication(delegate.mtm()),
+                                links,
+                            );
+                            assert!(chooser.window.isVisible());
+                            assert!(chooser.message.stringValue().to_string().contains(notice));
+                            assert!(state.timeout.borrow().is_none());
+                            assert!(!state.app.busy());
+                        }
                         timeout_preferences(false, "", &exclusions);
                     }
                     assert!(chooser.window.isVisible());
@@ -458,7 +489,7 @@ mod delegate {
                                         .contains(&browser.name)
                                 );
                             }
-                            let cell = ui::browser_cell(&browser, &settings.table, 0.0)
+                            let cell = ui::browser_cell(&browser, &settings.table, 0.0, false)
                                 .downcast::<NSTableCellView>()
                                 .unwrap();
                             assert_eq!(
@@ -569,78 +600,57 @@ mod delegate {
                         delegate.add_rule(sel!(addRule:), None);
                         assert!(!settings.rule_error.isHidden());
                         assert_eq!(settings.rules_table.numberOfRows(), 0);
-                        if settings.rule_browser.numberOfItems() > 1
-                            && let Some(browser) = state.app.settings_browser(0)
-                        {
-                            settings
-                                .rule_domain
-                                .setStringValue(ns_string!("https://WWW.Example.com/test"));
-                            settings.rule_browser.selectItemAtIndex(1);
-                            delegate.add_rule(sel!(addRule:), None);
-                            assert!(settings.rule_error.isHidden());
-                            assert_eq!(settings.rules_table.numberOfRows(), 1);
-                            assert!(settings.rules_hint.isHidden());
-                            assert!(settings.remove_rule.isEnabled());
-                            assert_eq!(
-                                state.app.rule(0),
-                                Some(browsers::Rule {
-                                    kind: browsers::MatchKind::Domain,
-                                    pattern: "www.example.com".into(),
-                                    target_key: browser.id.clone(),
-                                })
-                            );
-                            let cell = settings
-                                .rules_table
-                                .viewAtColumn_row_makeIfNecessary(0, 0, true)
+                        let exclusions: Vec<_> = browsers::exclusions().into_iter().collect();
+                        let missing = "io.github.choobro.missing-browser";
+                        let mut rules = vec![browsers::Rule {
+                            kind: browsers::MatchKind::Domain,
+                            pattern: "*.example.org".into(),
+                            target_key: missing.into(),
+                        }];
+                        preferences(false, "", &exclusions, &rules);
+                        state.app.refresh_settings(None);
+                        delegate.update_rules_settings(Some(0));
+                        assert_eq!(settings.rules_table.numberOfRows(), 1);
+                        assert!(settings.rules_hint.isHidden());
+                        assert!(settings.remove_rule.isEnabled());
+                        let cell = settings
+                            .rules_table
+                            .viewAtColumn_row_makeIfNecessary(0, 0, true)
+                            .unwrap()
+                            .downcast::<NSTableCellView>()
+                            .unwrap();
+                        assert_eq!(
+                            unsafe { cell.textField() }
                                 .unwrap()
-                                .downcast::<NSTableCellView>()
-                                .unwrap();
-                            assert_eq!(
-                                unsafe { cell.textField() }
-                                    .unwrap()
-                                    .stringValue()
-                                    .to_string(),
-                                "www.example.com"
-                            );
-                            let rule_popup = |row| {
-                                settings
-                                    .rules_table
-                                    .viewAtColumn_row_makeIfNecessary(1, row, true)
-                                    .unwrap()
-                                    .subviews()
-                                    .objectAtIndex(0)
-                                    .downcast::<NSPopUpButton>()
-                                    .unwrap()
-                            };
-                            assert_eq!(rule_popup(0).title().to_string(), browser.name);
-                            let missing = "io.github.choobro.missing-browser";
-                            assert_eq!(
-                                state.app.save_domain_rule("*.example.org", missing),
-                                Some(1)
-                            );
-                            delegate.update_rules_settings(Some(0));
-                            let popup = rule_popup(1);
-                            assert!(popup.title().to_string().starts_with("Unavailable"));
-                            assert!(!popup.itemAtIndex(0).unwrap().isEnabled());
-                            assert_eq!(settings.rules_table.selectedRow(), 0);
-                            popup.selectItemAtIndex(1);
-                            assert!(unsafe { popup.sendAction_to(popup.action(), Some(delegate)) });
-                            assert_eq!(popup.title().to_string(), browser.name);
-                            assert_eq!(settings.rules_table.numberOfRows(), 2);
-                            let expected = browsers::Rule {
-                                kind: browsers::MatchKind::Domain,
-                                pattern: "*.example.org".into(),
-                                target_key: browser.id.clone(),
-                            };
-                            assert_eq!(state.app.rule(1).as_ref(), Some(&expected));
-                            assert_eq!(state.app.rule(0).unwrap().pattern, "www.example.com");
-                            check_rule_scrollbar(delegate, settings, &browser.id);
-                            delegate.remove_rule(sel!(removeRule:), None);
-                            delegate.remove_rule(sel!(removeRule:), None);
-                            assert_eq!(settings.rules_table.numberOfRows(), 0);
-                            assert!(!settings.rules_hint.isHidden());
-                            assert!(!settings.remove_rule.isEnabled());
-                        }
+                                .stringValue()
+                                .to_string(),
+                            "*.example.org"
+                        );
+                        let popup = settings
+                            .rules_table
+                            .viewAtColumn_row_makeIfNecessary(1, 0, true)
+                            .unwrap()
+                            .subviews()
+                            .objectAtIndex(0)
+                            .downcast::<NSPopUpButton>()
+                            .unwrap();
+                        assert!(popup.title().to_string().starts_with("Unavailable"));
+                        assert!(!popup.itemAtIndex(0).unwrap().isEnabled());
+                        assert_eq!(popup.action(), Some(sel!(changeRuleTarget:)));
+                        rules.extend((0..12).map(|index| browsers::Rule {
+                            kind: browsers::MatchKind::Domain,
+                            pattern: format!("rule-{index}.example.org"),
+                            target_key: missing.into(),
+                        }));
+                        preferences(false, "", &exclusions, &rules);
+                        state.app.refresh_settings(None);
+                        delegate.update_rules_settings(Some(0));
+                        check_rule_scrollbar(settings);
+                        timeout_preferences(false, "", &exclusions);
+                        state.app.refresh_settings(None);
+                        delegate.update_rules_settings(None);
+                        assert_eq!(settings.rules_table.numberOfRows(), 0);
+                        assert!(!settings.remove_rule.isEnabled());
                         if let Some(browser) = state.app.settings_browser(0) {
                             let fake = browsers::Browser {
                                 id: "io.github.choobro.test-browser".into(),
@@ -739,7 +749,7 @@ mod delegate {
                         chooser.update(
                             Some(&crate::app::ChooserContent {
                                 preview: state.app.preview().unwrap(),
-                                domain: state.app.current_domain(),
+                                domain: Some("example.invalid".into()),
                                 selected_row: 0,
                                 count: 1,
                                 profile_notice: Some(browsers::ProfileNotice::PermissionDenied(
@@ -819,7 +829,7 @@ mod delegate {
                     let selected = chooser.table.selectedRow();
                     delegate.open_urls(sel!(application:openURLs:), &application, &urls);
                     assert_eq!(chooser.table.selectedRow(), selected);
-                    assert!(state.app.begin_dispatch().is_some());
+                    assert!(state.app.begin_dispatch(None).is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.open.isEnabled());
                     assert!(!chooser.copy.isEnabled());
@@ -853,13 +863,13 @@ mod delegate {
                     assert!(!chooser.message.isSelectable());
                     assert!(chooser.message.frame().size.height > 20.0);
                     assert!(chooser.message.frame().size.width <= 437.0);
-                    assert!(state.app.begin_dispatch().is_some());
+                    assert!(state.app.begin_dispatch(None).is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.window.isVisible());
                     delegate.dispatch_finished(true, "Test Browser");
                     assert!(state.app.has_pending());
                     assert!(chooser.window.isVisible());
-                    assert!(state.app.begin_dispatch().is_some());
+                    assert!(state.app.begin_dispatch(None).is_some());
                     delegate.set_busy(true);
                     assert!(!chooser.window.isVisible());
                     delegate.dispatch_finished(true, "Test Browser");
@@ -867,7 +877,7 @@ mod delegate {
                     assert!(!chooser.window.isVisible());
                     assert!(chooser.preview.stringValue().is_empty());
                     let long_url = format!(
-                        "https://example.invalid/safelink?url={}",
+                        "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.invalid%2F&data={}",
                         "a%2Fb%3Dc%26d".repeat(1000)
                     );
                     let url =
@@ -945,7 +955,7 @@ mod delegate {
                     );
                     pasteboard.clearContents();
                     println!(
-                        "Native smoke test passed: pre-launch and warm URL callbacks, settings, chooser layout, stable selection, failure/retry, queue, cancellation, long-URL wrapping and bounded window geometry. Snapshots: target/native-chooser.png, target/native-settings.png and target/native-long-url.png"
+                        "Native smoke test passed: pre-launch and warm URL callbacks, settings, chooser layout, stable selection, rule prompts, failure/retry, queue, cancellation, Safe Links wrapper preservation, long-URL wrapping and bounded window geometry. Snapshots: target/native-chooser.png, target/native-settings.png and target/native-long-url.png"
                     );
                 });
                 std::process::exit(0);
@@ -1020,13 +1030,7 @@ mod delegate {
         assert!(reused, "settings refresh must reuse native browser cells");
     }
 
-    fn check_rule_scrollbar(delegate: &Delegate, settings: &ui::Settings, target_key: &str) {
-        let app = &delegate.ivars().app;
-        let initial_count = app.rule_count();
-        for index in 0..12 {
-            app.save_domain_rule(&format!("rule-{index}.example.org"), target_key);
-        }
-        delegate.update_rules_settings(Some(0));
+    fn check_rule_scrollbar(settings: &ui::Settings) {
         let content = settings.window.contentView().unwrap();
         content.layoutSubtreeIfNeeded();
         let table = &settings.rules_table;
@@ -1046,10 +1050,6 @@ mod delegate {
             scroller.frame()
         );
         snapshot(&content, ns_string!("target/native-rules-settings.png"));
-        for index in (initial_count..app.rule_count()).rev() {
-            app.remove_rule(index);
-        }
-        delegate.update_rules_settings(Some(0));
     }
 
     fn snapshot(view: &NSView, path: &objc2_foundation::NSString) {

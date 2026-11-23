@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
-use objc2::{Message, rc::Retained};
-use objc2_foundation::{NSArray, NSURL, NSURLComponents, NSUTF8StringEncoding};
+use objc2::rc::Retained;
+use objc2_foundation::{NSArray, NSURL};
 
 const MAX_PENDING_URLS: usize = 256;
 const MAX_PENDING_URL_BYTES: usize = 8 * 1024 * 1024;
@@ -38,46 +38,6 @@ pub fn is_web_url(url: &NSURL) -> bool {
         && url.host().is_some_and(|host| !host.is_empty())
 }
 
-pub fn unwrap_url(url: &NSURL) -> Retained<NSURL> {
-    let mut current = url.retain();
-    for _ in 0..4 {
-        let Some(inner) = wrapped_target(&current) else {
-            break;
-        };
-        current = inner;
-    }
-    current
-}
-
-fn wrapped_target(url: &NSURL) -> Option<Retained<NSURL>> {
-    if !is_safelink_wrapper(url) {
-        return None;
-    }
-    let components = NSURLComponents::componentsWithURL_resolvingAgainstBaseURL(url, false)?;
-    let items = components.queryItems()?;
-    let target = items.iter().find_map(|item| {
-        (item.name().to_string().eq_ignore_ascii_case("url"))
-            .then(|| item.value())
-            .flatten()
-    })?;
-    let candidate = NSURL::URLWithString(&target)?;
-    is_web_url(&candidate).then_some(candidate)
-}
-
-fn is_safelink_wrapper(url: &NSURL) -> bool {
-    let Some(host) = url.host().map(|h| h.to_string().to_ascii_lowercase()) else {
-        return false;
-    };
-    let path = url
-        .path()
-        .map(|p| p.to_string().to_ascii_lowercase())
-        .unwrap_or_default();
-    host.ends_with(".safelinks.protection.outlook.com")
-        || host == "safelinks.protection.outlook.com"
-        || ((host == "teams.public.onecdn.static.microsoft" || host.ends_with(".microsoft.com"))
-            && path.contains("/safelinks/"))
-}
-
 #[derive(Default)]
 pub struct Requests {
     pending: VecDeque<Pending>,
@@ -99,26 +59,25 @@ impl Requests {
         if urls.len() > MAX_PENDING_URLS - self.pending_urls {
             return Err(Rejection::Full);
         }
-        let mut resolved = Vec::with_capacity(urls.len());
+        let mut original = Vec::with_capacity(urls.len());
         let mut bytes = 0;
         for url in urls {
-            if !is_web_url(&url) {
-                return Err(Rejection::Unsupported);
-            }
-            let url = unwrap_url(&url);
-            let value = url.absoluteString().ok_or(Rejection::Unsupported)?;
+            let value = url.relativeString();
             let remaining = MAX_PENDING_URL_BYTES - self.pending_bytes - bytes;
-            if value.len() > remaining {
+            if value.len_utf16() > remaining {
                 return Err(Rejection::Full);
             }
-            let length = value.lengthOfBytesUsingEncoding(NSUTF8StringEncoding);
+            let length = value.len();
             if length > remaining {
                 return Err(Rejection::Full);
             }
             bytes += length;
-            resolved.push(url);
+            original.push(url);
         }
-        let urls = NSArray::from_retained_slice(&resolved);
+        if !original.iter().all(|url| is_web_url(url)) {
+            return Err(Rejection::Unsupported);
+        }
+        let urls = NSArray::from_retained_slice(&original);
         self.pending_urls += urls.len();
         self.pending_bytes += bytes;
         self.pending.push_back(Pending { urls, bytes });
@@ -192,28 +151,38 @@ mod tests {
     }
 
     #[test]
-    fn unwraps_teams_and_outlook_safelinks_to_original_destination() {
-        let teams = "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=https%3A%2F%2Fwww.example.com%2Finbox%3Fq%3D1%26b%3D2&locale=en-us&dest=https%3A%2F%2Fteams.microsoft.com%2F";
+    fn forwards_safelinks_wrappers_without_rewriting() {
+        for wrapper in [
+            "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=https%3A%2F%2Fwww.example.com%2Finbox%3Fq%3D1%26b%3D2&locale=en-us&dest=https%3A%2F%2Fteams.microsoft.com%2F",
+            "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.example.com%2Fa&data=token%2F1#part",
+        ] {
+            let mut requests = Requests::default();
+            let delivered = urls(wrapper);
+            requests.push(&delivered).unwrap();
+            let forwarded = requests.begin().unwrap().objectAtIndex(0);
+            assert!(std::ptr::eq(&*forwarded, &*delivered.objectAtIndex(0)));
+            assert_eq!(forwarded.absoluteString().unwrap().to_string(), wrapper);
+            assert_eq!(requests.pending_bytes, wrapper.len());
+        }
+    }
+
+    #[test]
+    fn original_batch_size_is_checked_before_url_validation() {
         let mut requests = Requests::default();
-        requests.push(&urls(teams)).unwrap();
-        assert_eq!(
-            requests
-                .current()
-                .unwrap()
-                .objectAtIndex(0)
-                .absoluteString()
-                .unwrap()
-                .to_string(),
-            "https://www.example.com/inbox?q=1&b=2"
-        );
-        let evil = "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=file%3A%2F%2F%2Fetc%2Fpasswd";
-        assert_eq!(
-            unwrap_url(&urls(evil).objectAtIndex(0))
-                .absoluteString()
-                .unwrap()
-                .to_string(),
-            evil
-        );
+        let prefix = "https://example.com/";
+        requests.push(&urls(prefix)).unwrap();
+        let wrapper = urls(&format!(
+            "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com&data={}",
+            "x".repeat(MAX_PENDING_URL_BYTES)
+        ));
+        let batch = NSArray::from_retained_slice(&[
+            urls("file:///unsupported").objectAtIndex(0),
+            wrapper.objectAtIndex(0),
+        ]);
+        assert_eq!(requests.push(&batch), Err(Rejection::Full));
+        assert_eq!(requests.push(&wrapper), Err(Rejection::Full));
+        assert_eq!(requests.pending_urls, 1);
+        assert_eq!(requests.pending_bytes, prefix.len());
     }
 
     #[test]

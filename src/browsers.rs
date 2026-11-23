@@ -40,9 +40,9 @@ pub struct Rule {
 }
 
 impl Rule {
-    pub fn matches(&self, url: &NSURL) -> bool {
+    fn matches_domain(&self, domain: &str) -> bool {
         match self.kind {
-            MatchKind::Domain => url_domain(url).is_some_and(|domain| {
+            MatchKind::Domain => {
                 if let Some(suffix) = self.pattern.strip_prefix("*.") {
                     domain == suffix
                         || domain
@@ -51,7 +51,7 @@ impl Rule {
                 } else {
                     domain == self.pattern
                 }
-            }),
+            }
         }
     }
 }
@@ -121,9 +121,9 @@ pub fn url_domain(url: &NSURL) -> Option<String> {
 }
 
 pub fn shared_domain(urls: &NSArray<NSURL>) -> Option<String> {
-    let first = url_domain(&urls.objectAtIndex(0))?;
-    urls.iter()
-        .all(|url| url_domain(&url).as_deref() == Some(first.as_str()))
+    let mut urls = urls.iter();
+    let first = url_domain(&*urls.next()?)?;
+    urls.all(|url| url_domain(&url).as_deref() == Some(first.as_str()))
         .then_some(first)
 }
 
@@ -164,27 +164,27 @@ fn rules_from_defaults(defaults: &NSUserDefaults) -> Vec<Rule> {
         else {
             continue;
         };
-        if let Some(existing) = loaded
-            .iter_mut()
-            .find(|rule: &&mut Rule| rule.kind == kind && rule.pattern == pattern)
-        {
-            existing.target_key = target_key;
-        } else {
-            loaded.push(Rule {
+        upsert_rule(
+            &mut loaded,
+            Rule {
                 kind,
                 pattern,
                 target_key,
-            });
-        }
+            },
+        );
     }
     loaded
 }
 
 pub fn save_rules(rules: &[Rule]) {
-    save_rules_to_defaults(&NSUserDefaults::standardUserDefaults(), rules);
+    let values = rule_values(rules);
+    unsafe {
+        NSUserDefaults::standardUserDefaults()
+            .setObject_forKey(Some(&values), ns_string!("RoutingRules"));
+    }
 }
 
-fn save_rules_to_defaults(defaults: &NSUserDefaults, rules: &[Rule]) {
+pub fn rule_values(rules: &[Rule]) -> Retained<NSArray<NSDictionary<NSString, AnyObject>>> {
     let dicts: Vec<_> = rules
         .iter()
         .map(|rule| {
@@ -201,10 +201,7 @@ fn save_rules_to_defaults(defaults: &NSUserDefaults, rules: &[Rule]) {
             )
         })
         .collect();
-    let array = NSArray::from_retained_slice(&dicts);
-    unsafe {
-        defaults.setObject_forKey(Some(&array), ns_string!("RoutingRules"));
-    }
+    NSArray::from_retained_slice(&dicts)
 }
 
 pub fn upsert_rule(rules: &mut Vec<Rule>, rule: Rule) {
@@ -221,28 +218,26 @@ pub fn upsert_rule(rules: &mut Vec<Rule>, rule: Rule) {
 #[derive(Debug, PartialEq, Eq)]
 pub enum RuleRoute {
     Target(String),
-    MixedProfiles,
+    MixedTargets,
 }
 
 pub fn rule_route(rules: &[Rule], urls: &NSArray<NSURL>) -> Option<RuleRoute> {
+    if rules.is_empty() {
+        return None;
+    }
     let mut targets = urls.iter().map(|url| {
+        let domain = url_domain(&url)?;
         rules
             .iter()
-            .find(|rule| !rule.pattern.starts_with("*.") && rule.matches(&url))
-            .or_else(|| rules.iter().find(|rule| rule.matches(&url)))
+            .find(|rule| !rule.pattern.starts_with("*.") && rule.matches_domain(&domain))
+            .or_else(|| rules.iter().find(|rule| rule.matches_domain(&domain)))
             .map(|rule| rule.target_key.as_str())
     });
     let first = targets.next()?;
-    let mut has_profile = first.is_some_and(is_profile_target);
-    let mut mixed = false;
-    for target in targets {
-        has_profile |= target.is_some_and(is_profile_target);
-        mixed |= target != first;
-    }
-    if !mixed {
-        first.map(|key| RuleRoute::Target(key.to_owned()))
+    if targets.any(|target| target != first) {
+        Some(RuleRoute::MixedTargets)
     } else {
-        has_profile.then_some(RuleRoute::MixedProfiles)
+        first.map(|key| RuleRoute::Target(key.to_owned()))
     }
 }
 
@@ -257,10 +252,6 @@ pub struct Browser {
 }
 
 const PROFILE_KEY_PREFIX: &str = "profile:";
-
-pub fn is_profile_target(key: &str) -> bool {
-    key.starts_with(PROFILE_KEY_PREFIX)
-}
 
 pub fn rule_target_label(key: &str) -> String {
     if let Some((bundle, directory)) = key
@@ -876,76 +867,91 @@ mod tests {
         };
         let www = NSURL::URLWithString(ns_string!("https://WWW.EXAMPLE.COM:443/hello")).unwrap();
         let apex = NSURL::URLWithString(ns_string!("https://example.com/hello")).unwrap();
-        let deep = NSURL::URLWithString(ns_string!("https://a.b.example.com/hello")).unwrap();
-        let cousin = NSURL::URLWithString(ns_string!("https://badexample.com/hello")).unwrap();
-        assert!(exact.matches(&www));
-        assert!(!exact.matches(&apex));
-        assert!(wildcard.matches(&www));
-        assert!(wildcard.matches(&apex));
-        assert!(wildcard.matches(&deep));
-        assert!(!wildcard.matches(&cousin));
-        let rules = vec![wildcard, exact];
+        let rules = [wildcard, exact];
+        for (url, expected) in [
+            (www, Some("org.mozilla.firefox")),
+            (apex, Some("com.apple.Safari")),
+            (
+                NSURL::URLWithString(ns_string!("https://a.b.example.com/hello")).unwrap(),
+                Some("com.apple.Safari"),
+            ),
+            (
+                NSURL::URLWithString(ns_string!("https://badexample.com/hello")).unwrap(),
+                None,
+            ),
+        ] {
+            let urls = NSArray::from_retained_slice(&[url]);
+            assert_eq!(
+                rule_route(&rules, &urls),
+                expected.map(|key| RuleRoute::Target(key.into()))
+            );
+        }
+    }
+
+    #[test]
+    fn rules_match_safelinks_wrapper_hosts_not_embedded_destinations() {
+        let urls = NSArray::from_retained_slice(&[NSURL::URLWithString(ns_string!(
+            "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com"
+        ))
+        .unwrap()]);
+        let rules = [
+            Rule {
+                kind: MatchKind::Domain,
+                pattern: "example.com".into(),
+                target_key: "destination".into(),
+            },
+            Rule {
+                kind: MatchKind::Domain,
+                pattern: "*.safelinks.protection.outlook.com".into(),
+                target_key: "wrapper".into(),
+            },
+        ];
+        assert_eq!(rule_route(&[], &urls), None);
+        assert_eq!(rule_route(&rules[..1], &urls), None);
         assert_eq!(
-            rule_route(&rules, &NSArray::from_retained_slice(&[www])),
-            Some(RuleRoute::Target("org.mozilla.firefox".into()))
+            rule_route(&rules, &urls),
+            Some(RuleRoute::Target("wrapper".into()))
         );
         assert_eq!(
-            rule_route(&rules, &NSArray::from_retained_slice(&[apex])),
-            Some(RuleRoute::Target("com.apple.Safari".into()))
+            shared_domain(&urls),
+            Some("na01.safelinks.protection.outlook.com".into())
         );
     }
 
     #[test]
-    fn rules_round_trip_and_deduplicate_in_user_defaults() {
+    fn rules_from_defaults_upserts_normalized_duplicates_in_original_order() {
         use objc2::AnyThread;
         let defaults = NSUserDefaults::initWithSuiteName(
             NSUserDefaults::alloc(),
             Some(ns_string!("io.github.miguelcaravantes.choobro.rules-tests")),
         )
         .unwrap();
-        defaults.removeObjectForKey(ns_string!("RoutingRules"));
-        let mut list = Vec::new();
-        upsert_rule(
-            &mut list,
+        let list = [
             Rule {
                 kind: MatchKind::Domain,
-                pattern: "example.com".into(),
+                pattern: "Example.COM.".into(),
                 target_key: "com.google.Chrome".into(),
             },
-        );
-        upsert_rule(
-            &mut list,
             Rule {
                 kind: MatchKind::Domain,
                 pattern: "www.example.com".into(),
                 target_key: "profile:com.google.Chrome/Profile 1".into(),
             },
-        );
-        upsert_rule(
-            &mut list,
             Rule {
                 kind: MatchKind::Domain,
                 pattern: "example.com".into(),
                 target_key: "profile:com.google.Chrome/Default".into(),
             },
+        ];
+        let values = NSDictionary::<NSString, AnyObject>::from_slices(
+            &[ns_string!("RoutingRules")],
+            &[&*rule_values(&list)],
         );
-        save_rules_to_defaults(&defaults, &list);
+        unsafe {
+            defaults.setVolatileDomain_forName(&values, objc2_foundation::NSArgumentDomain);
+        }
         let loaded = rules_from_defaults(&defaults);
-        assert_eq!(
-            loaded,
-            vec![
-                Rule {
-                    kind: MatchKind::Domain,
-                    pattern: "example.com".into(),
-                    target_key: "profile:com.google.Chrome/Default".into(),
-                },
-                Rule {
-                    kind: MatchKind::Domain,
-                    pattern: "www.example.com".into(),
-                    target_key: "profile:com.google.Chrome/Profile 1".into(),
-                },
-            ]
-        );
+        assert_eq!(loaded, vec![list[2].clone(), list[1].clone()]);
         let single = NSArray::from_retained_slice(&[NSURL::URLWithString(ns_string!(
             "https://example.com/search?q=rust"
         ))
@@ -960,10 +966,9 @@ mod tests {
             NSURL::URLWithString(ns_string!("https://example.com/a")).unwrap(),
             NSURL::URLWithString(ns_string!("https://www.example.com/b")).unwrap(),
         ]);
-        assert_eq!(rule_route(&loaded, &mixed), Some(RuleRoute::MixedProfiles));
+        assert_eq!(rule_route(&loaded, &mixed), Some(RuleRoute::MixedTargets));
         assert_eq!(shared_domain(&single), Some("example.com".into()));
         assert_eq!(shared_domain(&mixed), None);
-        defaults.removeObjectForKey(ns_string!("RoutingRules"));
     }
 
     #[test]

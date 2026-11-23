@@ -14,11 +14,17 @@ use objc2_foundation::{
 };
 
 use crate::{
-    app::{App, Incoming, OpenRequest},
+    app::{App, Incoming, OpenRequest, SavedTarget},
     browsers,
     requests::Rejection,
     ui,
 };
+
+fn ambiguous_browser_message() -> &'static NSString {
+    ns_string!(
+        "More than one app matches the saved browser or profile. Choose by installation path."
+    )
+}
 
 thread_local! {
     static DELEGATE: OnceCell<Retained<Delegate>> = const { OnceCell::new() };
@@ -176,7 +182,7 @@ define_class!(
                         let parent_visible = browser.parent_is_visible(&excluded);
                         Some(ui::browser_toggle(&browser, row, enabled, parent_visible, table, self))
                     } else {
-                        Some(ui::browser_cell(&browser, table, 0.0))
+                        Some(ui::browser_cell(&browser, table, 0.0, false))
                     }
                 } else if is_rules_table(table) {
                     let rule = self.ivars().app.rule(row)?;
@@ -187,7 +193,10 @@ define_class!(
                         Some(ui::rule_browser_cell(&rule, &targets, table, self))
                     }
                 } else {
-                    self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, table, 8.0))
+                    self.ivars().app.browser(row).map(|browser| {
+                        let show_path = self.ivars().app.show_browser_path(&browser);
+                        ui::browser_cell(&browser, table, 8.0, show_path)
+                    })
                 }
             })
         }
@@ -269,8 +278,10 @@ define_class!(
             let preference = browsers::AutoOpen::load();
             if !preference.enabled || id.as_deref() != Some(&preference.browser_id)
                 || browsers::exclusions().contains(&preference.browser_id) { return; }
-            if let Some(index) = id.and_then(|id| self.ivars().app.timeout_browser(&id)) {
-                let _ = self.dispatch_browser(index, false);
+            match self.ivars().app.timeout_browser(&preference.browser_id) {
+                SavedTarget::Unique(index) => { let _ = self.dispatch_browser(index, false); }
+                SavedTarget::Ambiguous => chooser.message.setStringValue(ambiguous_browser_message()),
+                SavedTarget::Unavailable => {}
             }
         }
 
@@ -489,14 +500,18 @@ impl Delegate {
             return;
         }
         let preference = browsers::AutoOpen::load();
-        if !preference.enabled
-            || self
-                .ivars()
-                .app
-                .timeout_browser(&preference.browser_id)
-                .is_none()
-        {
+        if !preference.enabled {
             return;
+        }
+        match self.ivars().app.timeout_browser(&preference.browser_id) {
+            SavedTarget::Unavailable => return,
+            SavedTarget::Ambiguous => {
+                if let Some(chooser) = self.ivars().chooser.get() {
+                    chooser.message.setStringValue(ambiguous_browser_message());
+                }
+                return;
+            }
+            SavedTarget::Unique(_) => {}
         }
         let monitor = RcBlock::new(|event: std::ptr::NonNull<NSEvent>| {
             let native_event = unsafe { event.as_ref() };
@@ -559,11 +574,8 @@ impl Delegate {
         };
         if let Some(chooser) = self.ivars().chooser.get()
             && let Some(id) = self.ivars().timeout_browser.borrow().as_ref()
-            && let Some(browser) = self
-                .ivars()
-                .app
-                .timeout_browser(id)
-                .and_then(|index| self.ivars().app.browser(index))
+            && let SavedTarget::Unique(index) = self.ivars().app.timeout_browser(id)
+            && let Some(browser) = self.ivars().app.browser(index)
         {
             chooser.message.setStringValue(&NSString::from_str(&format!(
                 "Opening in {} in {seconds:.0}s. Interact to cancel automatic opening.",
@@ -623,10 +635,7 @@ impl Delegate {
 
     fn dispatch_browser(&self, index: usize, remember: bool) -> Option<&'static NSString> {
         self.cancel_timeout();
-        let domain = remember
-            .then(|| self.ivars().app.current_domain())
-            .flatten();
-        let message = match self.ivars().app.open(index) {
+        let message = match self.ivars().app.open(index, remember) {
             OpenRequest::None => return None,
             OpenRequest::Unavailable => {
                 self.refresh_chooser(false);
@@ -638,14 +647,6 @@ impl Delegate {
                 )
             }
             OpenRequest::Ready(browser, urls, arguments) => {
-                if let Some(domain) = domain
-                    && let Some(rule_index) = self
-                        .ivars()
-                        .app
-                        .save_domain_rule(&domain, &browser.target_key())
-                {
-                    self.update_rules_settings(Some(rule_index));
-                }
                 self.set_busy(true);
                 let name = browser.name.clone();
                 browsers::open(&browser, &urls, arguments.as_deref(), move |success| {
@@ -857,23 +858,22 @@ impl Delegate {
         let content = self.ivars().app.refresh(selected);
         let route_notice = if present && content.is_some() {
             match self.ivars().app.claim_route() {
-                Some(browsers::RuleRoute::MixedProfiles) => Some(ns_string!(
-                    "These links don’t share the same rule. Choose where to open them."
+                Some(browsers::RuleRoute::MixedTargets) => Some(ns_string!(
+                    "These links don’t share the same rule target. Choose where to open them."
                 )),
                 Some(browsers::RuleRoute::Target(target)) => {
-                    if let Some(index) = self.ivars().app.route_target(&target) {
-                        let notice = self.dispatch_browser(index, false);
-                        if self.ivars().app.busy() {
-                            return;
+                    match self.ivars().app.route_target(&target) {
+                        SavedTarget::Unique(index) => {
+                            let notice = self.dispatch_browser(index, false);
+                            if self.ivars().app.busy() {
+                                return;
+                            }
+                            notice
                         }
-                        notice
-                    } else if browsers::is_profile_target(&target) {
-                        self.cancel_timeout();
-                        Some(ns_string!(
-                            "The saved profile is unavailable. Choose a browser or profile for this link."
-                        ))
-                    } else {
-                        None
+                        SavedTarget::Ambiguous => Some(ambiguous_browser_message()),
+                        SavedTarget::Unavailable => Some(ns_string!(
+                            "The browser or profile saved by your rule is unavailable. Choose where to open the link."
+                        )),
                     }
                 }
                 None => None,
@@ -904,7 +904,15 @@ impl Delegate {
     }
 
     fn dispatch_finished(&self, success: bool, browser: &str) {
-        let present = self.ivars().app.dispatch_finished(success);
+        let (present, rule) = self.ivars().app.dispatch_finished(success);
+        if let Some(rule) = rule
+            && let Some(index) = self
+                .ivars()
+                .app
+                .save_domain_rule(&rule.pattern, &rule.target_key)
+        {
+            self.update_rules_settings(Some(index));
+        }
         self.refresh_chooser(present);
         if !success && let Some(chooser) = self.ivars().chooser.get() {
             chooser.dispatch_failed(browser, self.mtm());
