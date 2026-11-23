@@ -10,7 +10,7 @@ use objc2::{
 use objc2_app_kit::*;
 use objc2_foundation::{
     MainThreadMarker, NSArray, NSInteger, NSNotification, NSObject, NSObjectProtocol,
-    NSOperationQueue, NSString, NSTimer, NSURL, ns_string,
+    NSOperationQueue, NSProcessInfo, NSString, NSTimer, NSURL, ns_string,
 };
 
 use crate::{
@@ -37,6 +37,7 @@ pub struct State {
     countdown: RefCell<Option<Retained<NSTimer>>>,
     timeout_monitor: RefCell<Option<Retained<AnyObject>>>,
     updating_chooser: Cell<bool>,
+    returning_from_profile_privacy: Cell<bool>,
     timeout_browser: RefCell<Option<String>>,
 }
 
@@ -52,6 +53,9 @@ define_class!(
         #[unsafe(method(applicationDidBecomeActive:))]
         fn did_become_active(&self, _notification: &NSNotification) {
             self.refresh_default_status();
+            if self.ivars().returning_from_profile_privacy.replace(false) {
+                self.refresh_profile_access();
+            }
         }
 
         #[unsafe(method(applicationDidFinishLaunching:))]
@@ -167,8 +171,10 @@ define_class!(
                 if is_settings_table(table) {
                     let browser = self.ivars().app.settings_browser(row)?;
                     if column.is_some_and(|column| &*column.identifier() == ns_string!("enabled")) {
-                        let enabled = !browsers::exclusions().contains(&browser.id);
-                        Some(ui::browser_toggle(&browser, row, enabled, table, self))
+                        let excluded = browsers::exclusions();
+                        let enabled = !excluded.contains(&browser.target_key());
+                        let parent_visible = browser.parent_is_visible(&excluded);
+                        Some(ui::browser_toggle(&browser, row, enabled, parent_visible, table, self))
                     } else {
                         Some(ui::browser_cell(&browser, table, 0.0))
                     }
@@ -179,9 +185,11 @@ define_class!(
                     } else {
                         let browser = (0..self.ivars().app.settings_browser_count())
                             .filter_map(|index| self.ivars().app.settings_browser(index))
-                            .find(|browser| browser.id == rule.browser_id);
-                        let excluded = browsers::exclusions().contains(&rule.browser_id);
-                        Some(ui::rule_browser_cell(browser.as_ref(), &rule.browser_id, excluded, table))
+                            .find(|browser| browser.target_key() == rule.target_key);
+                        let excluded = browsers::exclusions();
+                        let hidden = browser.as_ref().is_some_and(|browser| !browser.is_visible(&excluded));
+                        let label = browsers::rule_target_label(&rule.target_key);
+                        Some(ui::rule_browser_cell(browser.as_ref(), &label, hidden, table))
                     }
                 } else {
                     self.ivars().app.browser(row).map(|browser| ui::browser_cell(&browser, table, 8.0))
@@ -249,7 +257,7 @@ define_class!(
             if !preference.enabled || id.as_deref() != Some(&preference.browser_id)
                 || browsers::exclusions().contains(&preference.browser_id) { return; }
             if let Some(index) = id.and_then(|id| self.ivars().app.timeout_browser(&id)) {
-                self.dispatch_browser(index, false);
+                let _ = self.dispatch_browser(index, false);
             }
         }
 
@@ -276,6 +284,46 @@ define_class!(
             }
         }
 
+        #[unsafe(method(openProfilePrivacy:))]
+        fn open_profile_privacy(&self, _sender: Option<&AnyObject>) {
+            self.cancel_timeout();
+            let macos_version = NSProcessInfo::processInfo().operatingSystemVersion().majorVersion;
+            let target = if macos_version >= 26 {
+                ns_string!("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders")
+            } else {
+                ns_string!("x-apple.systempreferences:com.apple.preference.security?Privacy_FilesAndFolders")
+            };
+            if NSURL::URLWithString(target).is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url)) {
+                self.ivars().returning_from_profile_privacy.set(true);
+            } else {
+                let directions = if macos_version >= 13 {
+                    "Open System Settings → Privacy & Security → Files & Folders, then expand ChooBro."
+                } else {
+                    "Open System Preferences → Security & Privacy → Privacy → Files and Folders."
+                };
+                ui::alert("Could not open Files & Folders", directions, self.mtm());
+            }
+        }
+
+        #[unsafe(method(showProfileSettings:))]
+        fn show_profile_settings(&self, sender: Option<&AnyObject>) {
+            self.show_settings(sel!(showSettings:), sender);
+            if let Some(settings) = &*self.ivars().settings.borrow() {
+                settings.select_tab(2);
+                settings.window.makeFirstResponder(Some(&*settings.profiles));
+            }
+        }
+
+        #[unsafe(method(chooseChromeFolder:))]
+        fn choose_chrome_folder(&self, _sender: Option<&AnyObject>) {
+            self.pick_profile_folder("Chrome");
+        }
+
+        #[unsafe(method(chooseChromeBetaFolder:))]
+        fn choose_chrome_beta_folder(&self, _sender: Option<&AnyObject>) {
+            self.pick_profile_folder("Chrome Beta");
+        }
+
         #[unsafe(method(showChooser:))]
         fn show_chooser(&self, _sender: Option<&AnyObject>) {
             self.cancel_timeout();
@@ -293,6 +341,12 @@ define_class!(
                 self.update_settings(index);
             }
             self.refresh_chooser(false);
+        }
+
+        #[unsafe(method(toggleBrowserProfiles:))]
+        fn toggle_browser_profiles(&self, sender: &NSButton) {
+            browsers::set_profiles_enabled(sender.state() == NSControlStateValueOn);
+            self.refresh_profile_access();
         }
 
         #[unsafe(method(changeBrowserSort:))]
@@ -324,7 +378,7 @@ define_class!(
             let Some(chooser) = self.ivars().chooser.get() else { return };
             let Ok(index) = usize::try_from(chooser.table.selectedRow()) else { return };
             let remember = !chooser.remember.isHidden() && chooser.remember.state() == NSControlStateValueOn;
-            self.dispatch_browser(index, remember);
+            let _ = self.dispatch_browser(index, remember);
         }
 
         #[unsafe(method(makeDefault:))]
@@ -391,9 +445,7 @@ impl Delegate {
 
     fn update_timeout_settings(&self) {
         if let Some(settings) = &*self.ivars().settings.borrow() {
-            let browsers: Vec<_> = (0..self.ivars().app.settings_browser_count())
-                .filter_map(|index| self.ivars().app.settings_browser(index))
-                .collect();
+            let browsers = self.ivars().app.settings_regular_browsers();
             settings.update_timeout(&browsers);
         }
     }
@@ -514,14 +566,14 @@ impl Delegate {
                 return;
             };
             let domain = settings.rule_domain.stringValue().to_string();
-            let browser_id = settings
+            let target_key = settings
                 .rule_browser
                 .selectedItem()
                 .and_then(|item| item.representedObject())
                 .and_then(|object| object.downcast::<NSString>().ok())
                 .map(|id| id.to_string())
                 .unwrap_or_default();
-            let Some(index) = self.ivars().app.save_domain_rule(&domain, &browser_id) else {
+            let Some(index) = self.ivars().app.save_domain_rule(&domain, &target_key) else {
                 settings.rule_error.setHidden(false);
                 return;
             };
@@ -549,45 +601,53 @@ impl Delegate {
 
     fn update_rules_settings(&self, selected_row: Option<usize>) {
         if let Some(settings) = &*self.ivars().settings.borrow() {
-            let browsers: Vec<_> = (0..self.ivars().app.settings_browser_count())
-                .filter_map(|index| self.ivars().app.settings_browser(index))
-                .collect();
+            let browsers = self.ivars().app.settings_rule_targets();
             let selected =
                 selected_row.or_else(|| usize::try_from(settings.rules_table.selectedRow()).ok());
             settings.update_rules(&browsers, selected);
         }
     }
 
-    fn dispatch_browser(&self, index: usize, remember: bool) {
+    fn dispatch_browser(&self, index: usize, remember: bool) -> Option<&'static NSString> {
         self.cancel_timeout();
         let domain = remember
             .then(|| self.ivars().app.current_domain())
             .flatten();
-        match self.ivars().app.open(index) {
-            OpenRequest::None => {}
+        let message = match self.ivars().app.open(index) {
+            OpenRequest::None => return None,
             OpenRequest::Unavailable => {
                 self.refresh_chooser(false);
-                if let Some(chooser) = self.ivars().chooser.get() {
-                    chooser.browser_unavailable();
-                }
+                ns_string!("That browser or profile is no longer available. Choose another.")
             }
-            OpenRequest::Ready(browser, urls) => {
+            OpenRequest::ProfileBatchTooLarge => {
+                ns_string!(
+                    "Chrome profiles support about 24 KiB per request. Choose a regular browser for these links."
+                )
+            }
+            OpenRequest::Ready(browser, urls, arguments) => {
                 if let Some(domain) = domain
-                    && let Some(rule_index) =
-                        self.ivars().app.save_domain_rule(&domain, &browser.id)
+                    && let Some(rule_index) = self
+                        .ivars()
+                        .app
+                        .save_domain_rule(&domain, &browser.target_key())
                 {
                     self.update_rules_settings(Some(rule_index));
                 }
                 self.set_busy(true);
                 let name = browser.name.clone();
-                browsers::open(&browser, &urls, move |success| {
+                browsers::open(&browser, &urls, arguments.as_deref(), move |success| {
                     let name = name.clone();
                     on_main(move || {
                         with_delegate(|delegate| delegate.dispatch_finished(success, &name))
                     });
                 });
+                return None;
             }
+        };
+        if let Some(chooser) = self.ivars().chooser.get() {
+            chooser.message.setStringValue(message);
         }
+        Some(message)
     }
 
     fn browser_drag_item(
@@ -603,7 +663,10 @@ impl Delegate {
             .app
             .settings_browser(usize::try_from(row).ok()?)?;
         let item = NSPasteboardItem::new();
-        if !item.setString_forType(&NSString::from_str(&browser.path), ui::browser_drag_type()) {
+        if !item.setString_forType(
+            &NSString::from_str(&browser.order_key()),
+            ui::browser_drag_type(),
+        ) {
             return None;
         }
         Some(ProtocolObject::from_retained(item))
@@ -616,10 +679,10 @@ impl Delegate {
         row: NSInteger,
         operation: NSTableViewDropOperation,
     ) -> bool {
-        let Some((path, insertion)) = self.browser_drop(table, info, row, operation) else {
+        let Some((key, insertion)) = self.browser_drop(table, info, row, operation) else {
             return false;
         };
-        let Some(destination) = self.ivars().app.drop_browser(&path, insertion) else {
+        let Some(destination) = self.ivars().app.drop_browser(&key, insertion) else {
             return false;
         };
         self.update_settings(destination);
@@ -642,14 +705,52 @@ impl Delegate {
             return None;
         }
         let insertion = usize::try_from(row).ok()?;
-        let path = info
+        let key = info
             .draggingPasteboard()
             .stringForType(ui::browser_drag_type())?
             .to_string();
-        self.ivars()
-            .app
-            .browser_drop_destination(&path, insertion)?;
-        Some((path, insertion))
+        self.ivars().app.browser_drop_destination(&key, insertion)?;
+        Some((key, insertion))
+    }
+
+    fn pick_profile_folder(&self, folder: &str) {
+        if !browsers::profiles_enabled() {
+            return;
+        }
+        self.cancel_timeout();
+        let Some(expected) = browsers::profile_folder_url(folder) else {
+            return;
+        };
+        let panel = NSOpenPanel::openPanel(self.mtm());
+        panel.setCanChooseFiles(false);
+        panel.setCanChooseDirectories(true);
+        panel.setResolvesAliases(false);
+        panel.setDirectoryURL(Some(&expected));
+        panel.setPrompt(Some(ns_string!("Allow Access")));
+        panel.setMessage(Some(&NSString::from_str(&format!(
+            "Choose the {folder} folder to let ChooBro read its profile list."
+        ))));
+        if panel.runModal() != NSModalResponseOK {
+            return;
+        }
+        if panel.URL().and_then(|url| url.path()) != expected.path() {
+            ui::alert(
+                "Choose the Chrome data folder",
+                &format!(
+                    "Select ~/Library/Application Support/Google/{folder}, not a profile subfolder."
+                ),
+                self.mtm(),
+            );
+            return;
+        }
+        self.refresh_profile_access();
+    }
+
+    fn refresh_profile_access(&self) {
+        if self.ivars().settings.borrow().is_some() {
+            self.refresh_settings(self.settings_selection());
+        }
+        self.refresh_chooser(false);
     }
 
     fn settings_selection(&self) -> Option<usize> {
@@ -661,7 +762,7 @@ impl Delegate {
     }
 
     fn refresh_settings(&self, selected: Option<usize>) {
-        let selected_row = self.ivars().app.refresh_settings(selected);
+        let (selected_row, profile_notice) = self.ivars().app.refresh_settings(selected);
         if self.ivars().settings.borrow().is_none() {
             let settings = ui::settings(self, self.ivars().app.configuring());
             if let Some(content) = settings.window.contentView() {
@@ -671,6 +772,13 @@ impl Delegate {
             self.ivars().settings.borrow_mut().replace(settings);
         }
         self.update_settings(selected_row);
+        if let Some(settings) = &*self.ivars().settings.borrow() {
+            settings.update_profile_setup(
+                browsers::profiles_enabled(),
+                profile_notice.as_ref(),
+                browsers::chrome_beta_installed(),
+            );
+        }
         self.refresh_default_status();
     }
 
@@ -734,16 +842,32 @@ impl Delegate {
         }
         let selected = usize::try_from(chooser.table.selectedRow()).ok();
         let content = self.ivars().app.refresh(selected);
-        if present
-            && content.is_some()
-            && let Some(browser_id) = self.ivars().app.claim_route()
-            && let Some(index) = self.ivars().app.timeout_browser(&browser_id)
-        {
-            self.dispatch_browser(index, false);
-            if self.ivars().app.busy() {
-                return;
+        let route_notice = if present && content.is_some() {
+            match self.ivars().app.claim_route() {
+                Some(browsers::RuleRoute::MixedProfiles) => Some(ns_string!(
+                    "These links don’t share the same rule. Choose where to open them."
+                )),
+                Some(browsers::RuleRoute::Target(target)) => {
+                    if let Some(index) = self.ivars().app.route_target(&target) {
+                        let notice = self.dispatch_browser(index, false);
+                        if self.ivars().app.busy() {
+                            return;
+                        }
+                        notice
+                    } else if browsers::is_profile_target(&target) {
+                        self.cancel_timeout();
+                        Some(ns_string!(
+                            "The saved profile is unavailable. Choose a browser or profile for this link."
+                        ))
+                    } else {
+                        None
+                    }
+                }
+                None => None,
             }
-        }
+        } else {
+            None
+        };
         self.ivars().updating_chooser.set(true);
         chooser.update(
             content.as_ref(),
@@ -753,7 +877,9 @@ impl Delegate {
             self.mtm(),
         );
         self.ivars().updating_chooser.set(false);
-        if present && content.is_some() {
+        if let Some(notice) = route_notice {
+            chooser.message.setStringValue(notice);
+        } else if present && content.is_some() {
             self.start_timeout();
         }
     }

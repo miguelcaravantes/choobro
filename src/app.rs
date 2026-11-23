@@ -33,7 +33,12 @@ pub enum Incoming {
 pub enum OpenRequest {
     None,
     Unavailable,
-    Ready(Browser, Retained<NSArray<NSURL>>),
+    ProfileBatchTooLarge,
+    Ready(
+        Browser,
+        Retained<NSArray<NSURL>>,
+        Option<Retained<NSArray<NSString>>>,
+    ),
 }
 
 pub struct ChooserContent {
@@ -41,6 +46,7 @@ pub struct ChooserContent {
     pub domain: Option<String>,
     pub selected_row: usize,
     pub count: usize,
+    pub profile_notice: Option<browsers::ProfileNotice>,
 }
 
 impl App {
@@ -86,20 +92,33 @@ impl App {
         browsers::shared_domain(requests.current()?)
     }
 
-    pub fn claim_route(&self) -> Option<String> {
+    pub fn claim_route(&self) -> Option<browsers::RuleRoute> {
+        self.claim_route_with(browsers::rules)
+    }
+
+    fn claim_route_with(
+        &self,
+        load: impl FnOnce() -> Vec<browsers::Rule>,
+    ) -> Option<browsers::RuleRoute> {
         if !self.has_pending() || self.busy() || !self.route_unclaimed.replace(false) {
             return None;
         }
         let requests = self.requests.borrow();
-        let urls = requests.current()?;
-        let rules = browsers::rules();
-        let browser_id = browsers::matching_rule_browser(&rules, urls)?;
+        let rules = load();
+        let route = browsers::rule_route(&rules, requests.current()?)?;
+        if route == browsers::RuleRoute::MixedProfiles {
+            self.cancel_timeout();
+        }
         *self.rules.borrow_mut() = rules;
         self.rules_loaded.set(true);
-        if browsers::exclusions().contains(&browser_id) {
-            return None;
-        }
-        Some(browser_id)
+        Some(route)
+    }
+
+    pub fn route_target(&self, key: &str) -> Option<usize> {
+        self.browsers
+            .borrow()
+            .iter()
+            .position(|browser| browser.target_key() == key)
     }
 
     pub fn refresh(&self, selected: Option<usize>) -> Option<ChooserContent> {
@@ -122,24 +141,22 @@ impl App {
                 urls.len(),
             )
         };
-        let selected_path = selected
-            .and_then(|index| self.browser(index))
-            .map(|browser| browser.path);
+        let selected = selected.and_then(|index| self.browser(index));
         let excluded = browsers::exclusions();
-        let browsers: Vec<_> = browsers::discover(&schemes)
+        let mut browsers: Vec<_> = browsers::discover(&schemes)
             .into_iter()
             .filter(|browser| !excluded.contains(&browser.id))
             .collect();
-        let selected_row = browsers
-            .iter()
-            .position(|browser| Some(&browser.path) == selected_path.as_ref())
-            .unwrap_or(0);
+        let profile_notice = browsers::add_profile_choices(&mut browsers);
+        browsers.retain(|browser| browser.is_visible(&excluded));
+        let selected_row = selected_browser_row(&browsers, selected.as_ref());
         *self.browsers.borrow_mut() = browsers;
         Some(ChooserContent {
             preview,
             domain,
             selected_row,
             count,
+            profile_notice,
         })
     }
 
@@ -151,19 +168,31 @@ impl App {
         self.settings_browsers.borrow().get(index).cloned()
     }
 
-    pub fn refresh_settings(&self, selected: Option<usize>) -> usize {
-        let selected_path = selected
-            .and_then(|index| self.settings_browser(index))
-            .map(|browser| browser.path);
-        let browsers = browsers::discover_all();
-        let selected_row = browsers
+    pub fn settings_rule_targets(&self) -> Vec<Browser> {
+        self.settings_browsers.borrow().clone()
+    }
+
+    pub fn settings_regular_browsers(&self) -> Vec<Browser> {
+        self.settings_browsers
+            .borrow()
             .iter()
-            .position(|browser| Some(&browser.path) == selected_path.as_ref())
-            .unwrap_or(0);
+            .filter(|browser| browser.profile.is_none())
+            .cloned()
+            .collect()
+    }
+
+    pub fn refresh_settings(
+        &self,
+        selected: Option<usize>,
+    ) -> (usize, Option<browsers::ProfileNotice>) {
+        let selected = selected.and_then(|index| self.settings_browser(index));
+        let mut browsers = browsers::discover_all();
+        let profile_notice = browsers::add_profile_choices(&mut browsers);
+        let selected_row = selected_browser_row(&browsers, selected.as_ref());
         *self.settings_browsers.borrow_mut() = browsers;
         *self.rules.borrow_mut() = browsers::rules();
         self.rules_loaded.set(true);
-        selected_row
+        (selected_row, profile_notice)
     }
 
     pub fn rule_count(&self) -> usize {
@@ -174,9 +203,9 @@ impl App {
         self.rules.borrow().get(index).cloned()
     }
 
-    pub fn save_domain_rule(&self, domain: &str, browser_id: &str) -> Option<usize> {
+    pub fn save_domain_rule(&self, domain: &str, target_key: &str) -> Option<usize> {
         let pattern = browsers::normalize_domain(domain)?;
-        if browser_id.is_empty() {
+        if target_key.is_empty() {
             return None;
         }
         if !self.rules_loaded.replace(true) {
@@ -188,7 +217,7 @@ impl App {
             browsers::Rule {
                 kind: browsers::MatchKind::Domain,
                 pattern: pattern.clone(),
-                browser_id: browser_id.to_owned(),
+                target_key: target_key.to_owned(),
             },
         );
         let index = rules
@@ -212,7 +241,7 @@ impl App {
 
     pub fn set_browser_enabled(&self, index: usize, enabled: bool) {
         if let Some(browser) = self.settings_browsers.borrow().get(index) {
-            browsers::set_excluded(&browser.id, !enabled);
+            browsers::set_excluded(&browser.target_key(), !enabled);
         }
     }
 
@@ -228,18 +257,20 @@ impl App {
         true
     }
 
-    pub fn browser_drop_destination(&self, path: &str, insertion: usize) -> Option<(usize, usize)> {
+    pub fn browser_drop_destination(&self, key: &str, insertion: usize) -> Option<(usize, usize)> {
         if !browsers::manual_order() {
             return None;
         }
         let browsers = self.settings_browsers.borrow();
-        let source = browsers.iter().position(|browser| browser.path == path)?;
+        let source = browsers
+            .iter()
+            .position(|browser| browser.order_key() == key)?;
         let destination = browsers::drop_destination(source, insertion, browsers.len())?;
         Some((source, destination))
     }
 
-    pub fn drop_browser(&self, path: &str, insertion: usize) -> Option<usize> {
-        let (source, destination) = self.browser_drop_destination(path, insertion)?;
+    pub fn drop_browser(&self, key: &str, insertion: usize) -> Option<usize> {
+        let (source, destination) = self.browser_drop_destination(key, insertion)?;
         self.move_browser(source, destination as isize - source as isize)
             .then_some(destination)
     }
@@ -256,7 +287,7 @@ impl App {
         self.browsers
             .borrow()
             .iter()
-            .position(|browser| browser.id == id)
+            .position(|browser| browser.id == id && browser.profile.is_none())
     }
 
     pub fn cancel(&self) {
@@ -275,14 +306,29 @@ impl App {
     }
 
     pub fn open(&self, index: usize) -> OpenRequest {
+        if self.busy() {
+            return OpenRequest::None;
+        }
         let Some(browser) = self.browser(index) else {
             return OpenRequest::None;
+        };
+        let arguments = if let Some(directory) = &browser.profile {
+            let requests = self.requests.borrow();
+            let Some(urls) = requests.current() else {
+                return OpenRequest::None;
+            };
+            let Some(arguments) = browsers::chrome_arguments(directory, urls) else {
+                return OpenRequest::ProfileBatchTooLarge;
+            };
+            Some(arguments)
+        } else {
+            None
         };
         if !browsers::available(&browser) {
             return OpenRequest::Unavailable;
         }
         match self.begin_dispatch() {
-            Some(urls) => OpenRequest::Ready(browser, urls),
+            Some(urls) => OpenRequest::Ready(browser, urls, arguments),
             None => OpenRequest::None,
         }
     }
@@ -321,6 +367,19 @@ impl App {
         }
         Some(status)
     }
+}
+
+fn selected_browser_row(rows: &[Browser], selection: Option<&Browser>) -> usize {
+    selection
+        .and_then(|selected| {
+            rows.iter()
+                .position(|row| row.path == selected.path && row.profile == selected.profile)
+                .or_else(|| {
+                    rows.iter()
+                        .position(|row| row.path == selected.path && row.profile.is_none())
+                })
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -420,6 +479,73 @@ mod tests {
         app.receive(&urls("https://third.example"));
         app.cancel_timeout();
         assert!(!app.claim_timeout());
+    }
+
+    #[test]
+    fn domain_rules_match_exact_profiles_while_auto_open_uses_regular_browsers() {
+        let app = App::default();
+        let chrome = Browser {
+            id: "com.google.Chrome".into(),
+            name: "Chrome".into(),
+            path: "/Chrome.app".into(),
+            url: NSURL::fileURLWithPath(ns_string!("/Chrome.app")),
+            icon: objc2_app_kit::NSImage::new(),
+            profile: None,
+        };
+        let profile = Browser {
+            profile: Some("Default".into()),
+            ..chrome.clone()
+        };
+        let key = profile.target_key();
+        app.browsers.borrow_mut().push(chrome.clone());
+        assert_eq!(app.route_target(&key), None);
+        app.browsers.borrow_mut().insert(0, profile);
+        assert_eq!(app.route_target(&key), Some(0));
+        assert_eq!(app.route_target(&chrome.id), Some(1));
+        assert_eq!(app.timeout_browser(&chrome.id), Some(1));
+    }
+
+    #[test]
+    fn mixed_batch_with_a_hidden_profile_rule_cancels_standalone_auto_open() {
+        let app = App::default();
+        let batch = NSArray::from_retained_slice(&[
+            urls("https://work.example").objectAtIndex(0),
+            urls("https://unruled.example").objectAtIndex(0),
+        ]);
+        app.receive(&batch);
+        let hidden_profile = "profile:com.google.Chrome/Profile 1";
+        assert!(app.route_target(hidden_profile).is_none());
+        assert_eq!(
+            app.claim_route_with(|| vec![browsers::Rule {
+                kind: browsers::MatchKind::Domain,
+                pattern: "work.example".into(),
+                target_key: hidden_profile.into(),
+            }]),
+            Some(browsers::RuleRoute::MixedProfiles)
+        );
+        assert!(!app.claim_timeout());
+        assert!(app.has_pending());
+    }
+
+    #[test]
+    fn oversized_profile_batch_is_rejected_before_dispatch_begins() {
+        let app = App::default();
+        let profile = Browser {
+            id: "com.google.Chrome".into(),
+            name: "Chrome — Work".into(),
+            path: "/Chrome.app".into(),
+            url: NSURL::fileURLWithPath(ns_string!("/Chrome.app")),
+            icon: objc2_app_kit::NSImage::new(),
+            profile: Some("Default".into()),
+        };
+        app.browsers.borrow_mut().push(profile);
+        app.receive(&urls(&format!(
+            "https://example.com/{}",
+            "a".repeat(25 * 1024)
+        )));
+        assert!(matches!(app.open(0), OpenRequest::ProfileBatchTooLarge));
+        assert!(!app.busy());
+        assert!(app.has_pending());
     }
 
     #[test]

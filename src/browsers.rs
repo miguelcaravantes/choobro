@@ -7,6 +7,9 @@ use objc2_foundation::{
     NSArray, NSBundle, NSDictionary, NSError, NSString, NSURL, NSUserDefaults, ns_string,
 };
 
+#[path = "browsers/chrome.rs"]
+mod chrome;
+
 pub const BUNDLE_ID: &str = "io.github.miguelcaravantes.choobro";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +36,7 @@ impl MatchKind {
 pub struct Rule {
     pub kind: MatchKind,
     pub pattern: String,
-    pub browser_id: String,
+    pub target_key: String,
 }
 
 impl Rule {
@@ -153,7 +156,7 @@ fn rules_from_defaults(defaults: &NSUserDefaults) -> Vec<Rule> {
         else {
             continue;
         };
-        let Some(browser_id) = dict
+        let Some(target_key) = dict
             .objectForKey(ns_string!("browser"))
             .and_then(|v| v.downcast::<NSString>().ok())
             .map(|v| v.to_string())
@@ -165,12 +168,12 @@ fn rules_from_defaults(defaults: &NSUserDefaults) -> Vec<Rule> {
             .iter_mut()
             .find(|rule: &&mut Rule| rule.kind == kind && rule.pattern == pattern)
         {
-            existing.browser_id = browser_id;
+            existing.target_key = target_key;
         } else {
             loaded.push(Rule {
                 kind,
                 pattern,
-                browser_id,
+                target_key,
             });
         }
     }
@@ -187,7 +190,7 @@ fn save_rules_to_defaults(defaults: &NSUserDefaults, rules: &[Rule]) {
         .map(|rule| {
             let kind = NSString::from_str(rule.kind.as_str());
             let pattern = NSString::from_str(&rule.pattern);
-            let browser = NSString::from_str(&rule.browser_id);
+            let browser = NSString::from_str(&rule.target_key);
             NSDictionary::<NSString, AnyObject>::from_slices(
                 &[
                     ns_string!("kind"),
@@ -209,27 +212,38 @@ pub fn upsert_rule(rules: &mut Vec<Rule>, rule: Rule) {
         .iter_mut()
         .find(|existing| existing.kind == rule.kind && existing.pattern == rule.pattern)
     {
-        existing.browser_id = rule.browser_id;
+        existing.target_key = rule.target_key;
     } else {
         rules.push(rule);
     }
 }
 
-pub fn matching_rule_browser(rules: &[Rule], urls: &NSArray<NSURL>) -> Option<String> {
-    if urls.is_empty() {
-        return None;
-    }
-    let match_url = |url: &NSURL| {
+#[derive(Debug, PartialEq, Eq)]
+pub enum RuleRoute {
+    Target(String),
+    MixedProfiles,
+}
+
+pub fn rule_route(rules: &[Rule], urls: &NSArray<NSURL>) -> Option<RuleRoute> {
+    let mut targets = urls.iter().map(|url| {
         rules
             .iter()
-            .find(|rule| !rule.pattern.starts_with("*.") && rule.matches(url))
-            .or_else(|| rules.iter().find(|rule| rule.matches(url)))
-    };
-    let first = urls.objectAtIndex(0);
-    let browser_id = match_url(&first)?.browser_id.clone();
-    urls.iter()
-        .all(|url| match_url(&url).is_some_and(|rule| rule.browser_id == browser_id))
-        .then_some(browser_id)
+            .find(|rule| !rule.pattern.starts_with("*.") && rule.matches(&url))
+            .or_else(|| rules.iter().find(|rule| rule.matches(&url)))
+            .map(|rule| rule.target_key.as_str())
+    });
+    let first = targets.next()?;
+    let mut has_profile = first.is_some_and(is_profile_target);
+    let mut mixed = false;
+    for target in targets {
+        has_profile |= target.is_some_and(is_profile_target);
+        mixed |= target != first;
+    }
+    if !mixed {
+        first.map(|key| RuleRoute::Target(key.to_owned()))
+    } else {
+        has_profile.then_some(RuleRoute::MixedProfiles)
+    }
 }
 
 #[derive(Clone)]
@@ -239,6 +253,140 @@ pub struct Browser {
     pub path: String,
     pub url: Retained<NSURL>,
     pub icon: Retained<NSImage>,
+    pub profile: Option<String>,
+}
+
+const PROFILE_KEY_PREFIX: &str = "profile:";
+
+pub fn is_profile_target(key: &str) -> bool {
+    key.starts_with(PROFILE_KEY_PREFIX)
+}
+
+pub fn rule_target_label(key: &str) -> String {
+    if let Some((bundle, directory)) = key
+        .strip_prefix(PROFILE_KEY_PREFIX)
+        .and_then(|value| value.split_once('/'))
+        && let Some((_, channel)) = chrome::CHANNELS.iter().find(|(id, _)| *id == bundle)
+    {
+        return format!("Google {channel} — {directory}");
+    }
+    key.to_owned()
+}
+
+impl Browser {
+    pub fn order_key(&self) -> String {
+        match &self.profile {
+            Some(profile) => format!("{PROFILE_KEY_PREFIX}{}/{profile}", self.path),
+            None => self.path.clone(),
+        }
+    }
+
+    pub fn target_key(&self) -> String {
+        match &self.profile {
+            Some(profile) => format!("{PROFILE_KEY_PREFIX}{}/{profile}", self.id),
+            None => self.id.clone(),
+        }
+    }
+
+    pub fn parent_is_visible(&self, excluded: &BTreeSet<String>) -> bool {
+        self.profile.is_none() || !excluded.contains(&self.id)
+    }
+
+    pub fn is_visible(&self, excluded: &BTreeSet<String>) -> bool {
+        self.parent_is_visible(excluded) && !excluded.contains(&self.target_key())
+    }
+}
+
+pub fn profiles_enabled() -> bool {
+    NSUserDefaults::standardUserDefaults().boolForKey(ns_string!("BrowserProfilesEnabled"))
+}
+
+pub fn set_profiles_enabled(enabled: bool) {
+    NSUserDefaults::standardUserDefaults()
+        .setBool_forKey(enabled, ns_string!("BrowserProfilesEnabled"));
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProfileNotice {
+    PermissionDenied(Vec<&'static str>),
+    NoProfiles,
+}
+
+pub fn add_profile_choices(browsers: &mut Vec<Browser>) -> Option<ProfileNotice> {
+    if !profiles_enabled() {
+        return None;
+    }
+    let notice = add_profile_choices_from(browsers, chrome::profiles);
+    if manual_order() {
+        sort_browsers(browsers, &saved_browser_order());
+    }
+    notice
+}
+
+pub fn chrome_beta_installed() -> bool {
+    NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&NSString::from_str(chrome::BETA_BUNDLE_ID))
+        .and_then(|url| url.path())
+        .is_some_and(|path| Path::new(&path.to_string()).is_dir())
+}
+
+pub fn profile_folder_url(folder: &str) -> Option<Retained<NSURL>> {
+    chrome::CHANNELS
+        .iter()
+        .any(|(_, channel)| *channel == folder)
+        .then(|| {
+            let path = chrome::data_directory(folder);
+            NSURL::fileURLWithPath_isDirectory(&NSString::from_str(&path.to_string_lossy()), true)
+        })
+}
+
+fn add_profile_choices_from(
+    browsers: &mut Vec<Browser>,
+    load: impl Fn(&str) -> std::io::Result<chrome::ProfileDiscovery>,
+) -> Option<ProfileNotice> {
+    let mut checked = false;
+    let mut denied = Vec::new();
+    let initial_count = browsers.len();
+    for (id, folder) in chrome::CHANNELS {
+        if !browsers.iter().any(|browser| browser.id == id) {
+            continue;
+        }
+        checked = true;
+        let discovery = match load(folder) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    denied.push(folder);
+                }
+                continue;
+            }
+        };
+        if discovery.permission_denied {
+            denied.push(folder);
+        }
+        for index in (0..browsers.len()).rev() {
+            let browser = &browsers[index];
+            if browser.id == id {
+                let choices: Vec<_> = discovery
+                    .profiles
+                    .iter()
+                    .map(|profile| Browser {
+                        name: format!("{} — {}", browser.name, profile.name),
+                        profile: Some(profile.directory.clone()),
+                        ..browser.clone()
+                    })
+                    .collect();
+                browsers.splice(index + 1..index + 1, choices);
+            }
+        }
+    }
+    if !denied.is_empty() {
+        Some(ProfileNotice::PermissionDenied(denied))
+    } else if checked && browsers.len() == initial_count {
+        Some(ProfileNotice::NoProfiles)
+    } else {
+        None
+    }
 }
 
 pub fn exclusions() -> BTreeSet<String> {
@@ -315,31 +463,47 @@ pub fn set_manual_order(manual: bool) {
     NSUserDefaults::standardUserDefaults().setBool_forKey(manual, ns_string!("ManualBrowserOrder"));
 }
 
+fn saved_browser_order() -> Vec<String> {
+    NSUserDefaults::standardUserDefaults()
+        .stringArrayForKey(ns_string!("BrowserOrder"))
+        .map(|values| values.iter().map(|value| value.to_string()).collect())
+        .unwrap_or_default()
+}
+
 pub fn set_browser_order(browsers: &[Browser]) {
-    let paths: Vec<_> = browsers
-        .iter()
-        .map(|browser| NSString::from_str(&browser.path))
-        .collect();
+    let keys = browsers.iter().map(Browser::order_key).collect::<Vec<_>>();
+    let order = merge_browser_order(&keys, &saved_browser_order());
+    let values: Vec<_> = order.iter().map(|key| NSString::from_str(key)).collect();
     unsafe {
         NSUserDefaults::standardUserDefaults().setObject_forKey(
-            Some(&NSArray::from_retained_slice(&paths)),
+            Some(&NSArray::from_retained_slice(&values)),
             ns_string!("BrowserOrder"),
         );
     }
 }
 
+fn merge_browser_order(keys: &[String], saved: &[String]) -> Vec<String> {
+    let mut pending = keys.iter().cloned();
+    let mut order = Vec::new();
+    for key in saved {
+        if keys.contains(key) {
+            order.extend(pending.next());
+        } else if key.starts_with(PROFILE_KEY_PREFIX) {
+            order.push(key.clone());
+        }
+    }
+    order.extend(pending);
+    order
+}
+
 fn sort_browsers(browsers: &mut [Browser], order: &[String]) {
-    browsers.sort_by(|a, b| {
-        let rank = |path: &str| {
-            order
-                .iter()
-                .position(|saved| saved == path)
-                .unwrap_or(usize::MAX)
-        };
-        rank(&a.path)
-            .cmp(&rank(&b.path))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            .then_with(|| a.path.cmp(&b.path))
+    browsers.sort_by_cached_key(|browser| {
+        let key = browser.order_key();
+        let rank = order
+            .iter()
+            .position(|saved| saved == &key)
+            .unwrap_or(usize::MAX);
+        (rank, browser.name.to_lowercase(), key)
     });
 }
 
@@ -445,16 +609,14 @@ fn discover_handlers(schemes: &BTreeSet<String>, require_all: bool) -> Vec<Brows
         browsers.push(Browser {
             id,
             name,
+            profile: None,
             icon: workspace.iconForFile(&NSString::from_str(&path)),
             path,
             url,
         });
     }
     let order = if manual_order() {
-        NSUserDefaults::standardUserDefaults()
-            .stringArrayForKey(ns_string!("BrowserOrder"))
-            .map(|values| values.iter().map(|value| value.to_string()).collect())
-            .unwrap_or_default()
+        saved_browser_order()
     } else {
         Vec::new()
     };
@@ -496,6 +658,10 @@ pub fn available(browser: &Browser) -> bool {
         && NSBundle::bundleWithURL(&browser.url)
             .and_then(|bundle| bundle.bundleIdentifier())
             .is_some_and(|id| id.to_string() == browser.id)
+        && browser
+            .profile
+            .as_deref()
+            .is_none_or(|directory| profiles_enabled() && chrome::available(&browser.id, directory))
 }
 
 pub fn is_app_bundle() -> bool {
@@ -512,19 +678,56 @@ fn open_configuration() -> Retained<NSWorkspaceOpenConfiguration> {
     configuration
 }
 
-pub fn open(browser: &Browser, urls: &NSArray<NSURL>, finished: impl Fn(bool) + Send + 'static) {
+pub fn open(
+    browser: &Browser,
+    urls: &NSArray<NSURL>,
+    arguments: Option<&NSArray<NSString>>,
+    finished: impl Fn(bool) + Send + 'static,
+) {
     let completion = RcBlock::new(
         move |_app: *mut NSRunningApplication, error: *mut NSError| {
             finished(error.is_null());
         },
     );
     let configuration = open_configuration();
-    NSWorkspace::sharedWorkspace().openURLs_withApplicationAtURL_configuration_completionHandler(
-        urls,
-        &browser.url,
-        &configuration,
-        Some(&completion),
-    );
+    let workspace = NSWorkspace::sharedWorkspace();
+    if let Some(arguments) = arguments {
+        configuration.setArguments(arguments);
+        configuration.setCreatesNewApplicationInstance(true);
+        workspace.openApplicationAtURL_configuration_completionHandler(
+            &browser.url,
+            &configuration,
+            Some(&completion),
+        );
+    } else {
+        workspace.openURLs_withApplicationAtURL_configuration_completionHandler(
+            urls,
+            &browser.url,
+            &configuration,
+            Some(&completion),
+        );
+    }
+}
+
+pub fn chrome_arguments(
+    directory: &str,
+    urls: &NSArray<NSURL>,
+) -> Option<Retained<NSArray<NSString>>> {
+    const CHROME_SINGLETON_SAFE_ARGUMENT_BYTES: usize = 24 * 1024;
+    let mut arguments = vec![
+        NSString::from_str(&format!("--profile-directory={directory}")),
+        ns_string!("--").into(),
+    ];
+    let mut bytes = arguments.iter().map(|arg| arg.len() + 1).sum::<usize>();
+    for url in urls {
+        let value = url.absoluteString()?;
+        bytes += value.len() + 1;
+        if bytes > CHROME_SINGLETON_SAFE_ARGUMENT_BYTES {
+            return None;
+        }
+        arguments.push(value);
+    }
+    Some(NSArray::from_retained_slice(&arguments))
 }
 
 pub fn set_default_scheme(index: usize, finished: impl Fn(bool) + Send + 'static) {
@@ -549,7 +752,84 @@ mod tests {
             path: path.into(),
             url: NSURL::fileURLWithPath(&NSString::from_str(path)),
             icon: NSImage::new(),
+            profile: None,
         }
+    }
+
+    #[test]
+    fn beta_profiles_appear_under_beta_even_when_stable_access_is_denied() {
+        let stable = Browser {
+            id: "com.google.Chrome".into(),
+            ..browser("Chrome", "/Chrome.app")
+        };
+        let beta = Browser {
+            id: "com.google.Chrome.beta".into(),
+            ..browser("Chrome Beta", "/Chrome Work.app")
+        };
+        let mut choices = vec![stable, beta];
+        let notice = add_profile_choices_from(&mut choices, |folder| match folder {
+            "Chrome" => Err(std::io::ErrorKind::PermissionDenied.into()),
+            "Chrome Beta" => Ok(chrome::ProfileDiscovery {
+                profiles: vec![chrome::Profile {
+                    directory: "Profile 2".into(),
+                    name: "Work".into(),
+                }],
+                permission_denied: false,
+            }),
+            _ => panic!("Unexpected profile directory"),
+        });
+        assert_eq!(
+            notice,
+            Some(ProfileNotice::PermissionDenied(vec!["Chrome"]))
+        );
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[2].name, "Chrome Beta — Work");
+        assert_eq!(choices[2].path, choices[1].path);
+        assert_eq!(choices[2].profile.as_deref(), Some("Profile 2"));
+    }
+
+    #[test]
+    fn chrome_profile_visibility_is_independent_but_respects_the_parent() {
+        let chrome = Browser {
+            id: "com.google.Chrome".into(),
+            ..browser("Chrome", "/Chrome.app")
+        };
+        let work = Browser {
+            profile: Some("Default".into()),
+            ..chrome.clone()
+        };
+        let personal = Browser {
+            profile: Some("Profile 1".into()),
+            ..chrome.clone()
+        };
+        let mut excluded = BTreeSet::from([work.target_key()]);
+        assert!(!work.is_visible(&excluded));
+        assert!(personal.is_visible(&excluded));
+        assert!(chrome.is_visible(&excluded));
+        excluded.insert(chrome.target_key());
+        assert!(!personal.is_visible(&excluded));
+        excluded.remove(&chrome.target_key());
+        assert!(personal.is_visible(&excluded));
+        assert!(!work.is_visible(&excluded));
+    }
+
+    #[test]
+    fn profile_order_survives_when_only_browser_rows_are_being_reordered() {
+        let chrome = browser("Chrome", "/Chrome.app");
+        let work = Browser {
+            name: "Chrome — Work".into(),
+            profile: Some("Default".into()),
+            ..chrome.clone()
+        };
+        let safari = browser("Safari", "/Safari.app");
+        let saved = [work.order_key(), chrome.order_key(), safari.order_key()];
+        let reordered = merge_browser_order(&[safari.order_key(), chrome.order_key()], &saved);
+        let mut rows = [chrome, work, safari];
+        sort_browsers(&mut rows, &reordered);
+        assert_eq!(
+            rows.map(|row| row.name),
+            ["Chrome — Work", "Safari", "Chrome"]
+        );
     }
 
     #[test]
@@ -587,12 +867,12 @@ mod tests {
         let exact = Rule {
             kind: MatchKind::Domain,
             pattern: "www.example.com".into(),
-            browser_id: "org.mozilla.firefox".into(),
+            target_key: "org.mozilla.firefox".into(),
         };
         let wildcard = Rule {
             kind: MatchKind::Domain,
             pattern: "*.example.com".into(),
-            browser_id: "com.apple.Safari".into(),
+            target_key: "com.apple.Safari".into(),
         };
         let www = NSURL::URLWithString(ns_string!("https://WWW.EXAMPLE.COM:443/hello")).unwrap();
         let apex = NSURL::URLWithString(ns_string!("https://example.com/hello")).unwrap();
@@ -606,12 +886,12 @@ mod tests {
         assert!(!wildcard.matches(&cousin));
         let rules = vec![wildcard, exact];
         assert_eq!(
-            matching_rule_browser(&rules, &NSArray::from_retained_slice(&[www])),
-            Some("org.mozilla.firefox".into())
+            rule_route(&rules, &NSArray::from_retained_slice(&[www])),
+            Some(RuleRoute::Target("org.mozilla.firefox".into()))
         );
         assert_eq!(
-            matching_rule_browser(&rules, &NSArray::from_retained_slice(&[apex])),
-            Some("com.apple.Safari".into())
+            rule_route(&rules, &NSArray::from_retained_slice(&[apex])),
+            Some(RuleRoute::Target("com.apple.Safari".into()))
         );
     }
 
@@ -630,7 +910,7 @@ mod tests {
             Rule {
                 kind: MatchKind::Domain,
                 pattern: "example.com".into(),
-                browser_id: "com.google.Chrome".into(),
+                target_key: "com.google.Chrome".into(),
             },
         );
         upsert_rule(
@@ -638,7 +918,7 @@ mod tests {
             Rule {
                 kind: MatchKind::Domain,
                 pattern: "www.example.com".into(),
-                browser_id: "org.mozilla.firefox".into(),
+                target_key: "profile:com.google.Chrome/Profile 1".into(),
             },
         );
         upsert_rule(
@@ -646,7 +926,7 @@ mod tests {
             Rule {
                 kind: MatchKind::Domain,
                 pattern: "example.com".into(),
-                browser_id: "com.apple.Safari".into(),
+                target_key: "profile:com.google.Chrome/Default".into(),
             },
         );
         save_rules_to_defaults(&defaults, &list);
@@ -657,12 +937,12 @@ mod tests {
                 Rule {
                     kind: MatchKind::Domain,
                     pattern: "example.com".into(),
-                    browser_id: "com.apple.Safari".into(),
+                    target_key: "profile:com.google.Chrome/Default".into(),
                 },
                 Rule {
                     kind: MatchKind::Domain,
                     pattern: "www.example.com".into(),
-                    browser_id: "org.mozilla.firefox".into(),
+                    target_key: "profile:com.google.Chrome/Profile 1".into(),
                 },
             ]
         );
@@ -671,14 +951,16 @@ mod tests {
         ))
         .unwrap()]);
         assert_eq!(
-            matching_rule_browser(&loaded, &single),
-            Some("com.apple.Safari".into())
+            rule_route(&loaded, &single),
+            Some(RuleRoute::Target(
+                "profile:com.google.Chrome/Default".into()
+            ))
         );
         let mixed = NSArray::from_retained_slice(&[
             NSURL::URLWithString(ns_string!("https://example.com/a")).unwrap(),
             NSURL::URLWithString(ns_string!("https://www.example.com/b")).unwrap(),
         ]);
-        assert_eq!(matching_rule_browser(&loaded, &mixed), None);
+        assert_eq!(rule_route(&loaded, &mixed), Some(RuleRoute::MixedProfiles));
         assert_eq!(shared_domain(&single), Some("example.com".into()));
         assert_eq!(shared_domain(&mixed), None);
         defaults.removeObjectForKey(ns_string!("RoutingRules"));
@@ -721,6 +1003,33 @@ mod tests {
         assert!(configuration.activates());
         assert!(!configuration.allowsRunningApplicationSubstitution());
         assert!(!configuration.addsToRecentItems());
+        assert!(!configuration.createsNewApplicationInstance());
+    }
+
+    #[test]
+    fn chrome_arguments_keep_each_link_intact_and_separate_from_switches() {
+        let links = [
+            "https://example.com/a%2Fb?x=a%26b#frag",
+            "http://example.org/?x=--incognito",
+        ];
+        let urls = links.map(|link| NSURL::URLWithString(&NSString::from_str(link)).unwrap());
+        let arguments =
+            chrome_arguments("Profile 2", &NSArray::from_retained_slice(&urls)).unwrap();
+        assert_eq!(
+            arguments
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect::<Vec<_>>(),
+            ["--profile-directory=Profile 2", "--", links[0], links[1]]
+        );
+    }
+
+    #[test]
+    fn chrome_rejects_batches_that_could_overflow_the_running_browser_handoff() {
+        let link = NSString::from_str(&format!("https://example.com/{}", "x".repeat(13 * 1024)));
+        let link = NSURL::URLWithString(&link).unwrap();
+        assert!(chrome_arguments("Default", &NSArray::from_slice(&[&*link])).is_some());
+        assert!(chrome_arguments("Default", &NSArray::from_slice(&[&*link, &*link])).is_none());
     }
 
     #[test]

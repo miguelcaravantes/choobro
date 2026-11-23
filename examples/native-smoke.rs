@@ -15,6 +15,7 @@ mod delegate {
         let ids: Vec<_> = excluded.iter().map(|id| NSString::from_str(id)).collect();
         let values = objc2_foundation::NSDictionary::<NSString, AnyObject>::from_slices(
             &[
+                ns_string!("BrowserProfilesEnabled"),
                 ns_string!("AutoOpenEnabled"),
                 ns_string!("AutoOpenSeconds"),
                 ns_string!("AutoOpenBrowser"),
@@ -22,6 +23,7 @@ mod delegate {
                 ns_string!("RoutingRules"),
             ],
             &[
+                &*objc2_foundation::NSNumber::new_bool(false),
                 &*objc2_foundation::NSNumber::new_bool(enabled),
                 &*objc2_foundation::NSNumber::new_f64(60.0),
                 &*NSString::from_str(browser_id),
@@ -217,6 +219,11 @@ mod delegate {
                         let settings = state.settings.borrow();
                         let settings = settings.as_ref().unwrap();
                         assert!(settings.window.isVisible());
+                        assert_eq!(settings.profiles.state(), NSControlStateValueOff);
+                        assert_eq!(
+                            settings.profiles.action(),
+                            Some(sel!(toggleBrowserProfiles:))
+                        );
                         assert_eq!(settings.auto_open.state(), NSControlStateValueOff);
                         assert!(settings.timeout_details.isHidden());
                         if let Some(browser) = state.app.settings_browser(0) {
@@ -432,6 +439,7 @@ mod delegate {
                                     &browser,
                                     0,
                                     enabled,
+                                    true,
                                     &settings.table,
                                     delegate,
                                 );
@@ -505,7 +513,43 @@ mod delegate {
                         assert!(!settings.window.isVisible());
                         assert_eq!(settings.window.title().to_string(), "ChooBro Settings");
                         let content = settings.window.contentView().unwrap();
-                        assert!(settings.tabs.segmentCount() == 2);
+                        assert_eq!(settings.tabs.segmentCount(), 3);
+                        assert!(settings.profiles_pane.isHidden());
+                        settings.select_tab(2);
+                        assert!(!settings.profiles_pane.isHidden());
+                        assert!(settings.browsers_pane.isHidden());
+                        assert!(settings.rules_pane.isHidden());
+                        assert!(
+                            settings
+                                .profile_actions
+                                .iter()
+                                .all(|button| !button.isEnabled())
+                        );
+                        assert_eq!(
+                            settings
+                                .profile_actions
+                                .each_ref()
+                                .map(|button| button.action()),
+                            [
+                                Some(sel!(openProfilePrivacy:)),
+                                Some(sel!(chooseChromeFolder:)),
+                                Some(sel!(chooseChromeBetaFolder:))
+                            ]
+                        );
+                        settings.update_profile_setup(true, None, false);
+                        assert!(settings.profile_actions[2].isHidden());
+                        settings.update_profile_setup(true, None, true);
+                        assert!(!settings.profile_actions[2].isHidden());
+                        assert!(
+                            settings
+                                .profile_actions
+                                .iter()
+                                .all(|button| button.isEnabled())
+                        );
+                        settings.update_profile_setup(false, None, false);
+                        content.layoutSubtreeIfNeeded();
+                        snapshot(&content, ns_string!("target/native-profile-settings.png"));
+                        settings.select_tab(0);
                         assert_eq!(settings.tabs.selectedSegment(), 0);
                         assert!(!settings.browsers_pane.isHidden());
                         assert!(settings.rules_pane.isHidden());
@@ -542,7 +586,7 @@ mod delegate {
                                 Some(browsers::Rule {
                                     kind: browsers::MatchKind::Domain,
                                     pattern: "www.example.com".into(),
-                                    browser_id: browser.id.clone(),
+                                    target_key: browser.id.clone(),
                                 })
                             );
                             let cell = settings
@@ -577,6 +621,45 @@ mod delegate {
                             assert!(!settings.remove_rule.isEnabled());
                         }
                         snapshot(&content, ns_string!("target/native-rules-settings.png"));
+                        if let Some(browser) = state.app.settings_browser(0) {
+                            let fake = browsers::Browser {
+                                id: "io.github.choobro.test-browser".into(),
+                                ..browser
+                            };
+                            let work = browsers::Browser {
+                                name: "Test Browser — Work".into(),
+                                profile: Some("Default".into()),
+                                ..fake.clone()
+                            };
+                            let personal = browsers::Browser {
+                                name: "Test Browser — Work (io.github.choobro.test-browser)".into(),
+                                profile: Some("Profile 1".into()),
+                                ..fake.clone()
+                            };
+                            let other = browsers::Browser {
+                                id: "io.github.choobro.test-other-browser".into(),
+                                name: work.name.clone(),
+                                ..fake.clone()
+                            };
+                            let browsers = [fake, work, personal, other];
+                            let keys = browsers.each_ref().map(browsers::Browser::target_key);
+                            settings.update_rules(&browsers, None);
+                            assert_eq!(settings.rule_browser.numberOfItems(), 5);
+                            let mut titles = std::collections::BTreeSet::new();
+                            for (index, key) in keys.iter().enumerate() {
+                                let item = settings
+                                    .rule_browser
+                                    .itemAtIndex(index as isize + 1)
+                                    .unwrap();
+                                let value = item
+                                    .representedObject()
+                                    .unwrap()
+                                    .downcast::<NSString>()
+                                    .unwrap();
+                                assert_eq!(value.to_string(), *key);
+                                assert!(titles.insert(item.title().to_string().to_lowercase()));
+                            }
+                        }
                         settings.select_tab(0);
                     }
                     delegate.show_settings(sel!(showSettings:), None);
@@ -626,6 +709,7 @@ mod delegate {
                         chooser.preview.stringValue().to_string(),
                         "https://example.invalid/a%2Fb?x=a%26b#test"
                     );
+                    assert!(chooser.profile_details.isHidden());
                     if state.app.browser_count() > 1 {
                         chooser
                             .table
@@ -638,6 +722,9 @@ mod delegate {
                                 domain: state.app.current_domain(),
                                 selected_row: 0,
                                 count: 1,
+                                profile_notice: Some(browsers::ProfileNotice::PermissionDenied(
+                                    vec!["Chrome", "Chrome Beta"],
+                                )),
                             }),
                             state.app.browser_count(),
                             false,
@@ -645,6 +732,12 @@ mod delegate {
                             delegate.mtm(),
                         );
                         content.layoutSubtreeIfNeeded();
+                        assert!(!chooser.profile_details.isHidden());
+                        assert_eq!(
+                            chooser.profile_details.action(),
+                            Some(sel!(showProfileSettings:))
+                        );
+                        assert!(chooser.table.frame().size.height >= 100.0);
                         let selected = chooser.table.rectOfRow(0);
                         let visible = chooser.table.visibleRect();
                         assert!(selected.origin.y >= visible.origin.y);
@@ -662,7 +755,17 @@ mod delegate {
                             .setDataSource(Some(ProtocolObject::from_ref(delegate)))
                     };
                     chooser.window.orderOut(None);
-                    delegate.show_settings(sel!(showSettings:), None);
+                    delegate.show_profile_settings(sel!(showProfileSettings:), None);
+                    assert_eq!(
+                        state
+                            .settings
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .tabs
+                            .selectedSegment(),
+                        2
+                    );
                     assert_eq!(
                         chooser.table.numberOfRows(),
                         state.app.browser_count() as isize

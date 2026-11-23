@@ -17,15 +17,15 @@ objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std", "block2", "objc2-core-foundation", "NSAccessibility", "NSAccessibilityProtocols", "NSAlert", "NSApplication", "NSButton",
     "NSBitmapImageRep", "NSImageRep", "NSBox", "NSCell", "NSColor", "NSControl", "NSDragging", "NSEvent", "NSFont", "NSImage", "NSImageView",
-    "NSLayoutConstraint", "NSLayoutAnchor", "NSMenu", "NSMenuItem", "NSParagraphStyle", "NSPasteboard", "NSPasteboardItem", "NSPopUpButton", "NSResponder",
-    "NSRunningApplication", "NSScrollView", "NSSegmentedControl", "NSClipView", "NSStackView",
+    "NSLayoutConstraint", "NSLayoutAnchor", "NSMenu", "NSMenuItem", "NSOpenPanel", "NSPanel", "NSParagraphStyle", "NSPasteboard", "NSPasteboardItem", "NSPopUpButton", "NSResponder",
+    "NSRunningApplication", "NSSavePanel", "NSScrollView", "NSSegmentedControl", "NSClipView", "NSStackView",
     "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSTableCellView",
     "NSTableColumn", "NSTableView", "NSTableHeaderView", "NSText", "NSTextField", "NSUserInterfaceLayout",
     "NSView", "NSViewController", "NSWindow", "NSWorkspace", "NSUserInterfaceItemIdentification",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std", "block2", "NSArray", "NSBundle", "NSData", "NSDictionary", "NSError", "NSGeometry",
-    "NSDate", "NSTimer", "NSIndexSet", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSRange", "NSString", "NSURL",
+    "NSDate", "NSTimer", "NSIndexSet", "NSJSONSerialization", "NSNotification", "NSObjCRuntime", "NSObject", "NSOperation", "NSPathUtilities", "NSProcessInfo", "NSRange", "NSString", "NSURL",
     "NSUserDefaults", "NSValue",
 ] }
 

@@ -9,7 +9,11 @@ use objc2_foundation::{
     MainThreadMarker, NSArray, NSIndexSet, NSRange, NSSize, NSString, ns_string,
 };
 
-use crate::{app::ChooserContent, browsers::Browser, delegate::Delegate};
+use crate::{
+    app::ChooserContent,
+    browsers::{Browser, ProfileNotice},
+    delegate::Delegate,
+};
 
 pub fn browser_drag_type() -> &'static NSString {
     ns_string!("io.github.miguelcaravantes.choobro.browser-order")
@@ -21,6 +25,9 @@ pub struct Chooser {
     pub preview: Retained<NSTextField>,
     pub copy: Retained<NSButton>,
     pub remember: Retained<NSButton>,
+    profile_notice: Retained<NSTextField>,
+    pub profile_details: Retained<NSButton>,
+    settings: Retained<NSButton>,
     pub message: Retained<NSTextField>,
     pub open: Retained<NSButton>,
     pub cancel: Retained<NSButton>,
@@ -33,6 +40,9 @@ pub struct Settings {
     pub tabs: Retained<NSSegmentedControl>,
     pub browsers_pane: Retained<NSStackView>,
     pub rules_pane: Retained<NSStackView>,
+    pub profiles_pane: Retained<NSStackView>,
+    pub profile_actions: [Retained<NSButton>; 3],
+    profile_status: Retained<NSTextField>,
     pub status: Retained<NSTextField>,
     pub default_warning: Retained<NSTextField>,
     pub make_default: Retained<NSButton>,
@@ -41,6 +51,7 @@ pub struct Settings {
     pub move_up: Retained<NSButton>,
     pub move_down: Retained<NSButton>,
     hint: Retained<NSTextField>,
+    pub profiles: Retained<NSButton>,
     pub auto_open: Retained<NSButton>,
     pub timeout_seconds: Retained<NSTextField>,
     pub timeout_browser: Retained<NSPopUpButton>,
@@ -65,12 +76,6 @@ impl Chooser {
         });
     }
 
-    pub fn browser_unavailable(&self) {
-        self.message.setStringValue(ns_string!(
-            "That browser is no longer available. Choose another browser."
-        ));
-    }
-
     pub fn dispatch_failed(&self, browser: &str, mtm: MainThreadMarker) {
         self.message.setStringValue(&NSString::from_str(&format!(
             "Could not open {browser}. Choose another browser or try again."
@@ -86,6 +91,12 @@ impl Chooser {
         reset_remember: bool,
         mtm: MainThreadMarker,
     ) {
+        let notice = content.and_then(|content| content.profile_notice.as_ref());
+        self.profile_notice
+            .setHidden(!matches!(notice, Some(ProfileNotice::NoProfiles)));
+        let denied = matches!(notice, Some(ProfileNotice::PermissionDenied(_)));
+        self.profile_details.setHidden(!denied);
+        self.settings.setHidden(denied);
         let Some(content) = content else {
             self.window.orderOut(None);
             self.preview.setStringValue(ns_string!(""));
@@ -100,7 +111,7 @@ impl Chooser {
             self.remember.setState(NSControlStateValueOff);
         }
         if let Some(domain) = &content.domain {
-            let label = format!("Always open {domain} in this browser");
+            let label = format!("Always use this choice for {domain}");
             self.remember.setTitle(&NSString::from_str(&label));
             self.remember.setToolTip(Some(&NSString::from_str(&label)));
             self.remember.setHidden(false);
@@ -148,14 +159,45 @@ impl Chooser {
 impl Settings {
     pub fn select_tab(&self, index: isize) {
         self.tabs.setSelectedSegment(index);
-        self.heading.setStringValue(if index == 1 {
-            ns_string!("Domain Rules")
-        } else {
-            ns_string!("Browsers")
+        self.heading.setStringValue(match index {
+            1 => ns_string!("Domain Rules"),
+            2 => ns_string!("Browser Profiles"),
+            _ => ns_string!("Browsers"),
         });
         self.refresh.setHidden(index != 0);
         self.browsers_pane.setHidden(index != 0);
         self.rules_pane.setHidden(index != 1);
+        self.profiles_pane.setHidden(index != 2);
+    }
+
+    pub fn update_profile_setup(
+        &self,
+        enabled: bool,
+        notice: Option<&ProfileNotice>,
+        chrome_beta_installed: bool,
+    ) {
+        self.profile_actions[2].setHidden(!chrome_beta_installed);
+        self.profiles.setState(if enabled {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        for action in &self.profile_actions {
+            action.setEnabled(enabled);
+        }
+        let status = match notice {
+            Some(ProfileNotice::PermissionDenied(channels)) => {
+                format!(
+                    "macOS blocked access to {} profiles.",
+                    channels.join(" and ")
+                )
+            }
+            Some(ProfileNotice::NoProfiles) => "No Chrome profiles found.".into(),
+            None => String::new(),
+        };
+        self.profile_status
+            .setStringValue(&NSString::from_str(&status));
+        self.profile_status.setHidden(status.is_empty());
     }
 
     pub fn update(&self, selected_row: usize, manual: bool) {
@@ -207,7 +249,7 @@ impl Settings {
             &self.rule_browser,
             browsers,
             &previous,
-            "Choose a browser…",
+            "Browser or profile…",
             false,
         );
     }
@@ -272,7 +314,7 @@ pub fn label(text: &str, mtm: MainThreadMarker) -> Retained<NSTextField> {
 fn populate_browser_popup(
     popup: &NSPopUpButton,
     browsers: &[Browser],
-    preferred_id: &str,
+    preferred_key: &str,
     placeholder: &str,
     show_unavailable: bool,
 ) {
@@ -281,14 +323,19 @@ fn populate_browser_popup(
     let excluded = crate::browsers::exclusions();
     let mut selected = 0;
     let mut listed = std::collections::BTreeSet::new();
+    let mut titles = std::collections::BTreeSet::from([placeholder.to_lowercase()]);
+    if show_unavailable {
+        titles.insert("saved browser unavailable".into());
+    }
     for browser in browsers
         .iter()
-        .filter(|browser| !excluded.contains(&browser.id))
+        .filter(|browser| browser.is_visible(&excluded))
     {
-        if !listed.insert(&browser.id) {
+        let key = browser.target_key();
+        if !listed.insert(key.clone()) {
             continue;
         }
-        let title = if browsers
+        let base = if browsers
             .iter()
             .any(|other| other.name == browser.name && other.id != browser.id)
         {
@@ -296,19 +343,29 @@ fn populate_browser_popup(
         } else {
             browser.name.clone()
         };
+        let mut title = base.clone();
+        let mut suffix = 2;
+        while !titles.insert(title.to_lowercase()) {
+            title = format!("{base} ({suffix})");
+            suffix += 1;
+        }
         popup.addItemWithTitle(&NSString::from_str(&title));
         let index = popup.numberOfItems() - 1;
         if let Some(item) = popup.itemAtIndex(index) {
             unsafe {
-                item.setRepresentedObject(Some(&NSString::from_str(&browser.id)));
+                item.setRepresentedObject(Some(&NSString::from_str(&key)));
             }
-            item.setToolTip(Some(&NSString::from_str(&browser.path)));
+            let tooltip = browser.profile.as_ref().map_or_else(
+                || browser.path.clone(),
+                |directory| format!("{}\nProfile folder: {directory}", browser.path),
+            );
+            item.setToolTip(Some(&NSString::from_str(&tooltip)));
         }
-        if browser.id == preferred_id {
+        if key == preferred_key {
             selected = index;
         }
     }
-    if show_unavailable && selected == 0 && !preferred_id.is_empty() {
+    if show_unavailable && selected == 0 && !preferred_key.is_empty() {
         popup
             .itemAtIndex(0)
             .unwrap()
@@ -348,6 +405,10 @@ enum ButtonAction {
     Cancel,
     Open,
     MakeDefault,
+    ProfilePrivacy,
+    ShowProfileSettings,
+    ChooseChromeFolder,
+    ChooseChromeBetaFolder,
     MoveUp,
     MoveDown,
     AddRule,
@@ -362,6 +423,10 @@ impl ButtonAction {
             Self::Cancel => sel!(cancelRequest:),
             Self::Open => sel!(openBrowser:),
             Self::MakeDefault => sel!(makeDefault:),
+            Self::ProfilePrivacy => sel!(openProfilePrivacy:),
+            Self::ShowProfileSettings => sel!(showProfileSettings:),
+            Self::ChooseChromeFolder => sel!(chooseChromeFolder:),
+            Self::ChooseChromeBetaFolder => sel!(chooseChromeBetaFolder:),
             Self::MoveUp => sel!(moveBrowserUp:),
             Self::MoveDown => sel!(moveBrowserDown:),
             Self::AddRule => sel!(addRule:),
@@ -463,7 +528,7 @@ pub fn chooser(target: &Delegate) -> Chooser {
         table.setTarget(Some(target));
         table.setDoubleAction(Some(sel!(openBrowser:)));
     }
-    table.setAccessibilityLabel(Some(ns_string!("Installed browsers")));
+    table.setAccessibilityLabel(Some(ns_string!("Browser choices")));
     let scroll = NSScrollView::new(mtm);
     scroll.setDocumentView(Some(&table));
     scroll.setHasVerticalScroller(true);
@@ -477,7 +542,7 @@ pub fn chooser(target: &Delegate) -> Chooser {
 
     let remember = unsafe {
         NSButton::checkboxWithTitle_target_action(
-            ns_string!("Always open this domain in this browser"),
+            ns_string!("Always use this choice for this domain"),
             Some(target),
             Some(sel!(toggleRemember:)),
             mtm,
@@ -487,6 +552,20 @@ pub fn chooser(target: &Delegate) -> Chooser {
     remember.setHidden(true);
     root.addArrangedSubview(&remember);
     fill_width(&remember, &root);
+
+    let profile_notice = label("No Chrome profiles found.", mtm);
+    profile_notice.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    profile_notice.setHidden(true);
+    root.addArrangedSubview(&profile_notice);
+    let profile_details = button(
+        "Profile Access Denied…",
+        ButtonAction::ShowProfileSettings,
+        target,
+    );
+    profile_details.setToolTip(Some(ns_string!(
+        "Open Profile Settings to view access details."
+    )));
+    profile_details.setHidden(true);
 
     let message = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
     message.setSelectable(false);
@@ -506,6 +585,7 @@ pub fn chooser(target: &Delegate) -> Chooser {
     let open = button("Open", ButtonAction::Open, target);
     open.setKeyEquivalent(ns_string!("\r"));
     actions.addArrangedSubview(&settings);
+    actions.addArrangedSubview(&profile_details);
     let spacer = NSView::new(mtm);
     actions.addArrangedSubview(&spacer);
     actions.addArrangedSubview(&cancel);
@@ -519,6 +599,9 @@ pub fn chooser(target: &Delegate) -> Chooser {
         preview,
         copy,
         remember,
+        profile_notice,
+        profile_details,
+        settings,
         message,
         open,
         cancel,
@@ -572,6 +655,7 @@ pub fn browser_toggle(
     browser: &Browser,
     index: usize,
     enabled: bool,
+    parent_visible: bool,
     table: &NSTableView,
     target: &Delegate,
 ) -> Retained<NSView> {
@@ -612,7 +696,12 @@ pub fn browser_toggle(
     } else {
         NSControlStateValueOff
     });
-    let description = NSString::from_str(&format!("Show {} in the browser chooser", browser.name));
+    toggle.setEnabled(parent_visible);
+    let description = NSString::from_str(&if parent_visible {
+        format!("Show {} in the browser chooser", browser.name)
+    } else {
+        format!("{} is hidden because its browser is hidden", browser.name)
+    });
     toggle.setAccessibilityLabel(Some(&description));
     toggle.setToolTip(Some(&description));
     Retained::into_super(cell)
@@ -652,7 +741,7 @@ pub fn rule_domain_cell(pattern: &str, table: &NSTableView) -> Retained<NSView> 
 
 pub fn rule_browser_cell(
     browser: Option<&Browser>,
-    browser_id: &str,
+    target_label: &str,
     excluded: bool,
     table: &NSTableView,
 ) -> Retained<NSView> {
@@ -687,7 +776,7 @@ pub fn rule_browser_cell(
         });
     let text = match browser {
         Some(browser) => format!("{} (hidden)", browser.name),
-        None => format!("Unavailable ({browser_id})"),
+        None => format!("Unavailable ({target_label})"),
     };
     let value = NSString::from_str(&text);
     unsafe { cell.textField() }
@@ -705,7 +794,11 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     let refresh = button("", ButtonAction::Settings, target);
     let tabs = unsafe {
         NSSegmentedControl::segmentedControlWithLabels_trackingMode_target_action(
-            &NSArray::from_slice(&[ns_string!("Browsers"), ns_string!("Rules")]),
+            &NSArray::from_slice(&[
+                ns_string!("Browsers"),
+                ns_string!("Rules"),
+                ns_string!("Profiles"),
+            ]),
             NSSegmentSwitchTracking::SelectOne,
             Some(target),
             Some(sel!(changeSettingsTab:)),
@@ -881,7 +974,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     let rules_pane = stack(mtm, true);
     let rules_subtitle = NSTextField::wrappingLabelWithString(
         ns_string!(
-            "Links matching a saved domain open directly in its assigned browser without showing the chooser."
+            "Links matching a saved domain open directly in its assigned browser or profile."
         ),
         mtm,
     );
@@ -898,7 +991,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         rule_domain.setAction(Some(sel!(addRule:)));
     }
     let rule_browser = NSPopUpButton::new(mtm);
-    rule_browser.setAccessibilityLabel(Some(ns_string!("Browser for domain")));
+    rule_browser.setAccessibilityLabel(Some(ns_string!("Browser or profile for domain")));
     let add_rule = button("Add Rule", ButtonAction::AddRule, target);
     add_row.addArrangedSubview(&rule_domain);
     add_row.addArrangedSubview(&rule_browser);
@@ -909,9 +1002,13 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         .widthAnchor()
         .constraintGreaterThanOrEqualToConstant(200.0)
         .setActive(true);
+    rule_browser
+        .widthAnchor()
+        .constraintLessThanOrEqualToConstant(200.0)
+        .setActive(true);
 
     let rule_error = label(
-        "Enter a valid domain (like example.com or *.example.com) and choose an enabled browser.",
+        "Enter a valid domain and choose a visible browser or profile.",
         mtm,
     );
     rule_error.setTextColor(Some(&NSColor::systemRedColor()));
@@ -928,7 +1025,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     domain_col.setMinWidth(140.0);
     let browser_col =
         NSTableColumn::initWithIdentifier(NSTableColumn::alloc(mtm), ns_string!("ruleBrowser"));
-    browser_col.setTitle(ns_string!("Browser"));
+    browser_col.setTitle(ns_string!("Browser or profile"));
     browser_col.setWidth(240.0);
     browser_col.setMinWidth(140.0);
     rules_table.addTableColumn(&domain_col);
@@ -984,6 +1081,77 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
     root.addArrangedSubview(&rules_pane);
     fill_width(&rules_pane, &root);
 
+    let profiles_pane = stack(mtm, true);
+    let profiles = unsafe {
+        NSButton::checkboxWithTitle_target_action(
+            ns_string!("Show Chrome profiles in the chooser"),
+            Some(target),
+            Some(sel!(toggleBrowserProfiles:)),
+            mtm,
+        )
+    };
+    profiles_pane.addArrangedSubview(&profiles);
+    for text in [
+        "Profile support is currently limited to Google Chrome, including Chrome Beta.",
+        "ChooBro needs access to each Chrome version’s data folder to find its profiles. Other local apps may be able to see links opened in a profile.",
+        "Use the Browsers tab to choose which profiles appear and in what order.",
+    ] {
+        let help = NSTextField::wrappingLabelWithString(&NSString::from_str(text), mtm);
+        help.setTextColor(Some(&NSColor::secondaryLabelColor()));
+        profiles_pane.addArrangedSubview(&help);
+        fill_width(&help, &profiles_pane);
+    }
+    let profile_actions = [
+        button(
+            "Open Files & Folders…",
+            ButtonAction::ProfilePrivacy,
+            target,
+        ),
+        button(
+            "Choose Chrome Folder…",
+            ButtonAction::ChooseChromeFolder,
+            target,
+        ),
+        button(
+            "Choose Chrome Beta Folder…",
+            ButtonAction::ChooseChromeBetaFolder,
+            target,
+        ),
+    ];
+    profile_actions[2].setHidden(true);
+    let profile_status = NSTextField::wrappingLabelWithString(ns_string!(""), mtm);
+    profile_status.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    profile_status.setHidden(true);
+    profiles_pane.addArrangedSubview(&profile_status);
+    fill_width(&profile_status, &profiles_pane);
+    for action in &profile_actions {
+        action.setEnabled(false);
+    }
+    profiles_pane.addArrangedSubview(&profile_actions[0]);
+    let permission_steps = NSTextField::wrappingLabelWithString(
+        ns_string!(
+            "1. In System Settings, find ChooBro and click the arrow next to it.\n2. Turn on the switch for your browser, such as Google Chrome.\n3. Return to ChooBro to refresh the profile list."
+        ),
+        mtm,
+    );
+    profiles_pane.addArrangedSubview(&permission_steps);
+    fill_width(&permission_steps, &profiles_pane);
+    let fallback = NSTextField::wrappingLabelWithString(
+        ns_string!(
+            "If ChooBro or your browser isn’t listed, or the switch turns itself off, use the matching folder button below."
+        ),
+        mtm,
+    );
+    fallback.setTextColor(Some(&NSColor::secondaryLabelColor()));
+    profiles_pane.addArrangedSubview(&fallback);
+    fill_width(&fallback, &profiles_pane);
+    for action in &profile_actions[1..] {
+        profiles_pane.addArrangedSubview(action);
+    }
+    root.addArrangedSubview(&profiles_pane);
+    fill_width(&profiles_pane, &root);
+    profiles_pane.setHidden(true);
+
     let divider = NSBox::new(mtm);
     divider.setBoxType(NSBoxType::Separator);
     root.addArrangedSubview(&divider);
@@ -1034,6 +1202,9 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         tabs,
         browsers_pane,
         rules_pane,
+        profiles_pane,
+        profile_actions,
+        profile_status,
         status,
         default_warning,
         make_default,
@@ -1042,6 +1213,7 @@ pub fn settings(target: &Delegate, configuring: bool) -> Settings {
         move_up,
         move_down,
         hint,
+        profiles,
         auto_open,
         timeout_seconds,
         timeout_browser,
