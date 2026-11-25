@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use objc2::rc::Retained;
-use objc2_foundation::{NSArray, NSURL};
+use objc2_foundation::{NSArray, NSURL, NSURLComponents};
 
 const MAX_PENDING_URLS: usize = 256;
 const MAX_PENDING_URL_BYTES: usize = 8 * 1024 * 1024;
@@ -38,6 +38,46 @@ pub fn is_web_url(url: &NSURL) -> bool {
         && url.host().is_some_and(|host| !host.is_empty())
 }
 
+fn safelink_destination(url: &NSURL) -> Option<Retained<NSURL>> {
+    if !url.scheme()?.to_string().eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let host = url.host()?.to_string().to_ascii_lowercase();
+    let outlook = host == "safelinks.protection.outlook.com"
+        || host.ends_with(".safelinks.protection.outlook.com");
+    let teams = host == "teams.public.onecdn.static.microsoft"
+        && url.path().is_some_and(|path| {
+            let path = path.to_string();
+            path.starts_with("/evergreen-assets/safelinks/")
+                && path.ends_with("/atp-safelinks.html")
+        });
+    if !outlook && !teams {
+        return None;
+    }
+    let components = NSURLComponents::componentsWithURL_resolvingAgainstBaseURL(url, false)?;
+    let items = components.queryItems()?;
+    let mut targets = items
+        .iter()
+        .filter(|item| item.name().to_string().eq_ignore_ascii_case("url"));
+    let target = targets.next()?.value()?;
+    if targets.next().is_some() {
+        return None;
+    }
+    let destination = NSURL::URLWithString(&target)?;
+    is_web_url(&destination).then_some(destination)
+}
+
+fn link_destination(url: &Retained<NSURL>) -> Retained<NSURL> {
+    let mut destination = url.clone();
+    for _ in 0..4 {
+        let Some(inner) = safelink_destination(&destination) else {
+            break;
+        };
+        destination = inner;
+    }
+    destination
+}
+
 #[derive(Default)]
 pub struct Requests {
     pending: VecDeque<Pending>,
@@ -48,6 +88,7 @@ pub struct Requests {
 
 struct Pending {
     urls: Retained<NSArray<NSURL>>,
+    destinations: Retained<NSArray<NSURL>>,
     bytes: usize,
 }
 
@@ -77,15 +118,25 @@ impl Requests {
         if !original.iter().all(|url| is_web_url(url)) {
             return Err(Rejection::Unsupported);
         }
+        let destinations: Vec<_> = original.iter().map(link_destination).collect();
+        let destinations = NSArray::from_retained_slice(&destinations);
         let urls = NSArray::from_retained_slice(&original);
         self.pending_urls += urls.len();
         self.pending_bytes += bytes;
-        self.pending.push_back(Pending { urls, bytes });
+        self.pending.push_back(Pending {
+            urls,
+            destinations,
+            bytes,
+        });
         Ok(())
     }
 
     pub fn current(&self) -> Option<&NSArray<NSURL>> {
         self.pending.front().map(|pending| &*pending.urls)
+    }
+
+    pub fn destinations(&self) -> Option<&NSArray<NSURL>> {
+        self.pending.front().map(|pending| &*pending.destinations)
     }
 
     pub fn begin(&mut self) -> Option<Retained<NSArray<NSURL>>> {
@@ -151,18 +202,44 @@ mod tests {
     }
 
     #[test]
-    fn forwards_safelinks_wrappers_without_rewriting() {
-        for wrapper in [
-            "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=https%3A%2F%2Fwww.example.com%2Finbox%3Fq%3D1%26b%3D2&locale=en-us&dest=https%3A%2F%2Fteams.microsoft.com%2F",
-            "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.example.com%2Fa&data=token%2F1#part",
+    fn decodes_safelink_destinations_without_rewriting_forwarded_wrappers() {
+        for (wrapper, destination) in [
+            (
+                "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=https%3A%2F%2Fwww.example.com%2Finbox%3Fq%3D1%26b%3D2&locale=en-us&dest=https%3A%2F%2Fteams.microsoft.com%2F",
+                "https://www.example.com/inbox?q=1&b=2",
+            ),
+            (
+                "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.example.com%2Fa%252Fb%3Fq%3Da+b%23part%25202&data=token%2F1#outer",
+                "https://www.example.com/a%2Fb?q=a+b#part%202",
+            ),
+            (
+                "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Feu01.safelinks.protection.outlook.com%2F%3Furl%3Dhttps%253A%252F%252Fexample.com",
+                "https://example.com",
+            ),
         ] {
             let mut requests = Requests::default();
             let delivered = urls(wrapper);
             requests.push(&delivered).unwrap();
+            let decoded = requests.destinations().unwrap().objectAtIndex(0);
+            assert_eq!(decoded.absoluteString().unwrap().to_string(), destination);
             let forwarded = requests.begin().unwrap().objectAtIndex(0);
             assert!(std::ptr::eq(&*forwarded, &*delivered.objectAtIndex(0)));
             assert_eq!(forwarded.absoluteString().unwrap().to_string(), wrapper);
             assert_eq!(requests.pending_bytes, wrapper.len());
+        }
+    }
+
+    #[test]
+    fn leaves_unrecognized_or_invalid_safelinks_untouched() {
+        for wrapper in [
+            "https://na01.safelinks.protection.outlook.com.example.org/?url=https%3A%2F%2Fexample.com",
+            "https://teams.public.onecdn.static.microsoft/other?url=https%3A%2F%2Fexample.com",
+            "https://na01.safelinks.protection.outlook.com/?url=file%3A%2F%2F%2Fprivate",
+            "https://na01.safelinks.protection.outlook.com/?url=%2Frelative",
+            "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com&URL=https%3A%2F%2Fother.example",
+        ] {
+            let url = urls(wrapper).objectAtIndex(0);
+            assert!(std::ptr::eq(&*link_destination(&url), &*url));
         }
     }
 

@@ -83,7 +83,7 @@ impl App {
     pub fn preview(&self) -> Option<Retained<NSString>> {
         self.requests
             .borrow()
-            .current()
+            .destinations()
             .and_then(|urls| urls.objectAtIndex(0).absoluteString())
     }
 
@@ -114,7 +114,7 @@ impl App {
         }
         let requests = self.requests.borrow();
         let rules = load();
-        let route = browsers::rule_route(&rules, requests.current()?)?;
+        let route = browsers::rule_route(&rules, requests.destinations()?)?;
         self.cancel_timeout();
         *self.rules.borrow_mut() = rules;
         self.rules_loaded.set(true);
@@ -152,12 +152,14 @@ impl App {
                         .map(|value| value.to_string().to_ascii_lowercase())
                 })
                 .collect();
+            let destinations = requests.destinations()?;
             (
                 schemes,
-                urls.objectAtIndex(0)
+                destinations
+                    .objectAtIndex(0)
                     .absoluteString()
                     .unwrap_or_else(|| ns_string!("Web link").into()),
-                browsers::shared_domain(urls),
+                browsers::shared_domain(destinations),
                 urls.len(),
             )
         };
@@ -320,13 +322,14 @@ impl App {
         &self,
         remember_target: Option<&str>,
     ) -> Option<Retained<NSArray<NSURL>>> {
-        let urls = self.requests.borrow_mut().begin()?;
+        let mut requests = self.requests.borrow_mut();
+        let urls = requests.begin()?;
         self.cancel_timeout();
         self.route_unclaimed.set(false);
         *self.remembered_rule.borrow_mut() = remember_target.and_then(|target_key| {
             Some(browsers::Rule {
                 kind: browsers::MatchKind::Domain,
-                pattern: browsers::shared_domain(&urls)?,
+                pattern: browsers::shared_domain(requests.destinations()?)?,
                 target_key: target_key.to_owned(),
             })
         });
@@ -489,6 +492,41 @@ mod tests {
         assert!(app.claim_route().is_none());
         app.cancel();
         assert!(!app.has_pending());
+    }
+
+    #[test]
+    fn safelinks_use_destination_rules_and_remember_the_destination_domain() {
+        let app = App::default();
+        let wrapper = "https://teams.public.onecdn.static.microsoft/evergreen-assets/safelinks/2/atp-safelinks.html?url=https%3A%2F%2Fexample.com%2Finbox";
+        let batch = NSArray::from_retained_slice(&[
+            urls(wrapper).objectAtIndex(0),
+            urls("https://example.com/other").objectAtIndex(0),
+        ]);
+        assert_eq!(app.receive(&batch), Incoming::Show);
+        assert_eq!(
+            app.preview().unwrap().to_string(),
+            "https://example.com/inbox"
+        );
+        assert_eq!(
+            app.claim_route_with(|| vec![
+                browsers::Rule {
+                    kind: browsers::MatchKind::Domain,
+                    pattern: "teams.public.onecdn.static.microsoft".into(),
+                    target_key: "wrapper.browser".into(),
+                },
+                browsers::Rule {
+                    kind: browsers::MatchKind::Domain,
+                    pattern: "example.com".into(),
+                    target_key: "destination.browser".into(),
+                },
+            ]),
+            Some(browsers::RuleRoute::Target("destination.browser".into()))
+        );
+        assert!(!app.claim_timeout());
+        let forwarded = app.begin_dispatch(Some("chosen.browser")).unwrap();
+        assert_eq!(&*forwarded, &*batch);
+        let (_, remembered) = app.dispatch_finished(true);
+        assert_eq!(remembered.unwrap().pattern, "example.com");
     }
 
     #[test]

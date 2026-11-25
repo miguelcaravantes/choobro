@@ -889,36 +889,6 @@ mod tests {
     }
 
     #[test]
-    fn rules_match_safelinks_wrapper_hosts_not_embedded_destinations() {
-        let urls = NSArray::from_retained_slice(&[NSURL::URLWithString(ns_string!(
-            "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.com"
-        ))
-        .unwrap()]);
-        let rules = [
-            Rule {
-                kind: MatchKind::Domain,
-                pattern: "example.com".into(),
-                target_key: "destination".into(),
-            },
-            Rule {
-                kind: MatchKind::Domain,
-                pattern: "*.safelinks.protection.outlook.com".into(),
-                target_key: "wrapper".into(),
-            },
-        ];
-        assert_eq!(rule_route(&[], &urls), None);
-        assert_eq!(rule_route(&rules[..1], &urls), None);
-        assert_eq!(
-            rule_route(&rules, &urls),
-            Some(RuleRoute::Target("wrapper".into()))
-        );
-        assert_eq!(
-            shared_domain(&urls),
-            Some("na01.safelinks.protection.outlook.com".into())
-        );
-    }
-
-    #[test]
     fn rules_from_defaults_upserts_normalized_duplicates_in_original_order() {
         use objc2::AnyThread;
         let defaults = NSUserDefaults::initWithSuiteName(

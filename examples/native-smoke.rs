@@ -876,13 +876,14 @@ mod delegate {
                     assert!(!state.app.has_pending());
                     assert!(!chooser.window.isVisible());
                     assert!(chooser.preview.stringValue().is_empty());
-                    let long_url = format!(
-                        "https://na01.safelinks.protection.outlook.com/?url=https%3A%2F%2Fexample.invalid%2F&data={}",
-                        "a%2Fb%3Dc%26d".repeat(1000)
+                    let long_url =
+                        format!("https://example.invalid/{}", "a%2Fb%3Dc%26d".repeat(1000));
+                    let wrapper = format!(
+                        "https://na01.safelinks.protection.outlook.com/?url={}&data=token",
+                        long_url.replace('%', "%25")
                     );
-                    let url =
-                        NSURL::URLWithString(&objc2_foundation::NSString::from_str(&long_url))
-                            .unwrap();
+                    let url = NSURL::URLWithString(&objc2_foundation::NSString::from_str(&wrapper))
+                        .unwrap();
                     delegate.open_urls(
                         sel!(application:openURLs:),
                         &application,
@@ -955,7 +956,7 @@ mod delegate {
                     );
                     pasteboard.clearContents();
                     println!(
-                        "Native smoke test passed: pre-launch and warm URL callbacks, settings, chooser layout, stable selection, rule prompts, failure/retry, queue, cancellation, Safe Links wrapper preservation, long-URL wrapping and bounded window geometry. Snapshots: target/native-chooser.png, target/native-settings.png and target/native-long-url.png"
+                        "Native smoke test passed: pre-launch and warm URL callbacks, settings, chooser layout, stable selection, rule prompts, failure/retry, queue, cancellation, decoded Safe Links preview and copy, long-URL wrapping and bounded window geometry. Snapshots: target/native-chooser.png, target/native-settings.png and target/native-long-url.png"
                     );
                 });
                 std::process::exit(0);
